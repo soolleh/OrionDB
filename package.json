@@ -1,0 +1,14 @@
+{
+  "name": "oriondb",
+  "version": "1.0.0",
+  "description": "A TypeScript-first, zero-config, file-based relational database with a Prisma-like API. No server. No native bindings. No setup. Built for local-first applications.",
+  "main": "index.js",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "Soleh",
+  "license": "MIT"
+}
