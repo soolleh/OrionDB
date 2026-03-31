@@ -1,0 +1,42 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+lib/
+
+# Coverage
+coverage/
+.nyc_output/
+
+# Logs
+*.log
+
+# Environment files
+.env
+.env.*
+
+# Lock files (optional - usually formatted anyway)
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Compiled files
+*.js
+*.d.ts
+*.js.map
+
+# Cache
+.cache/
+.parcel-cache/
+.vite/
+
+# Misc
+.DS_Store
+Thumbs.db
+
+# Test database artifacts
+tests/**/*.db/
+tests/**/testdb/
+tmp-db/
