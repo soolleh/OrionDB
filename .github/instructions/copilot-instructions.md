@@ -1,6 +1,6 @@
 # OrionDB — Developer Instructions & Contributor Guide
 
-> **Version:** 0.2.0-draft | **Phase:** 1 MVP | **Last Updated:** 2026-04-14
+> **Version:** 0.2.0-draft | **Phase:** 1 MVP | **Last Updated:** 2026-04-15
 > This document is the single source of truth for how OrionDB is built, structured, tested, and extended. Every contributor and AI coding agent working on this codebase must read and follow this document completely.
 
 ---
@@ -143,24 +143,47 @@ That is the entire setup. Data is stored in human-readable NDJSON files on the l
 
 ### 3.2 Source Code Structure
 
+Each module is a **folder with multiple focused files** rather than a single monolithic `index.ts`. Every module folder contains an `index.ts` that acts as an internal barrel — it re-exports the module's public surface for consumption by other modules. No logic lives in `index.ts` files.
+
 ```
 oriondb/
 ├── src/
 │   ├── client/
-│   │   └── index.ts           ← createClient, db instance, model proxy
+│   │   ├── index.ts           ← barrel: re-exports from files below
+│   │   └── client.ts          ← createClient, db instance, model proxy
 │   ├── schema/
-│   │   └── index.ts           ← schema definition, validation, mismatch detection
+│   │   ├── index.ts           ← barrel: re-exports from files below
+│   │   ├── types.ts           ← all schema-related type definitions and interfaces
+│   │   ├── parser.ts          ← parseModelSchema, validateScalarField, validateRelationField
+│   │   ├── serializer.ts      ← serializeSchema, deserializeSchema, readSchemaFile, writeSchemaFile
+│   │   ├── mismatch.ts        ← diffSchemas, applyMismatchStrategy, validateSchema
+│   │   └── relations.ts       ← validateRelationships, validateForeignKeyExists
 │   ├── query/
-│   │   └── index.ts           ← filter engine, orderBy, pagination, aggregations
+│   │   ├── index.ts           ← barrel: re-exports from files below
+│   │   ├── types.ts           ← query-related type definitions
+│   │   ├── filter.ts          ← where clause evaluation, operator matching
+│   │   ├── sort.ts            ← orderBy implementation
+│   │   ├── pagination.ts      ← skip/take logic
+│   │   └── aggregations.ts    ← count, aggregate, groupBy
 │   ├── persistence/
-│   │   └── index.ts           ← NDJSON read/write, file size counter, startup scan
+│   │   ├── index.ts           ← barrel: re-exports from files below
+│   │   ├── types.ts           ← persistence-related type definitions
+│   │   ├── writer.ts          ← append logic, file size counter, serialization
+│   │   ├── reader.ts          ← indexed lookup, full scan, readline streaming
+│   │   └── compaction.ts      ← compaction algorithm, lock, write queue
 │   ├── index-manager/
-│   │   └── index.ts           ← IndexManager class, logical + physical indexes
+│   │   ├── index.ts           ← barrel: re-exports from files below
+│   │   ├── types.ts           ← PrimaryKey, FieldValue, IndexManagerOptions, IndexManager interface
+│   │   └── index-manager.ts   ← IndexManagerImpl class
 │   ├── relations/
-│   │   └── index.ts           ← relationship resolver, batched include, nested writes
+│   │   ├── index.ts           ← barrel: re-exports from files below
+│   │   ├── types.ts           ← relation resolver type definitions
+│   │   ├── resolver.ts        ← batched include resolution
+│   │   └── nested-writes.ts   ← nested create/update logic
 │   ├── errors/
-│   │   └── index.ts           ← full error hierarchy
-│   └── index.ts               ← public barrel export
+│   │   ├── index.ts           ← barrel: re-exports from files below
+│   │   └── errors.ts          ← full error class hierarchy
+│   └── index.ts               ← public barrel: the only export surface for consumers
 ├── tests/
 │   └── unit/
 │       ├── errors/
@@ -168,16 +191,25 @@ oriondb/
 │       ├── index-manager/
 │       │   └── index-manager.test.ts
 │       ├── schema/
-│       │   └── schema.test.ts
-│       ├── persistence/
-│       │   └── persistence.test.ts
-│       ├── query/
-│       │   └── query.test.ts
-│       ├── relations/
+│       │   ├── parser.test.ts
+│       │   ├── serializer.test.ts
+│       │   ├── mismatch.test.ts
 │       │   └── relations.test.ts
+│       ├── persistence/
+│       │   ├── writer.test.ts
+│       │   ├── reader.test.ts
+│       │   └── compaction.test.ts
+│       ├── query/
+│       │   ├── filter.test.ts
+│       │   ├── sort.test.ts
+│       │   ├── pagination.test.ts
+│       │   └── aggregations.test.ts
+│       ├── relations/
+│       │   ├── resolver.test.ts
+│       │   └── nested-writes.test.ts
 │       └── placeholder.test.ts
 ├── dist/                      ← build output (never commit)
-├── instructions.md            ← this file
+├── OrionDB-Developer-Guide.md ← this file
 ├── README.md
 ├── package.json
 ├── tsconfig.json
@@ -187,7 +219,65 @@ oriondb/
 └── .prettierrc
 ```
 
-### 3.3 NDJSON Record Format
+### 3.3 Module Structure Rules
+
+These rules are **mandatory** for every module. They are not suggestions.
+
+**Rule 1 — No logic in `index.ts`.**
+Every module's `index.ts` contains only `export { ... } from './file.js'` re-export statements. No functions, no classes, no constants, no type definitions.
+
+```ts
+// ✅ Good — src/schema/index.ts
+export type { SchemaInput, ParsedModelDefinition, FieldDefinition } from './types.js'
+export { parseModelSchema } from './parser.js'
+export { serializeSchema, deserializeSchema, readSchemaFile, writeSchemaFile } from './serializer.js'
+export { diffSchemas, applyMismatchStrategy, validateSchema } from './mismatch.js'
+export { validateRelationships } from './relations.js'
+
+// ❌ Bad — logic inside index.ts
+export function parseModelSchema(...) { ... }
+```
+
+**Rule 2 — One clear responsibility per file.**
+Each file within a module covers exactly one cohesive concern. If a file has more than one distinct concern, split it.
+
+| File | Allowed contents |
+|---|---|
+| `types.ts` | Type aliases, interfaces, discriminated unions — no runtime code |
+| `parser.ts` | Parsing and validation logic for that module |
+| `serializer.ts` | Serialization and deserialization logic |
+| `mismatch.ts` | Diff and strategy application logic |
+| `relations.ts` | Cross-model relationship validation |
+| `writer.ts` | Write path logic |
+| `reader.ts` | Read path logic |
+| `compaction.ts` | Compaction algorithm only |
+
+**Rule 3 — Types live in `types.ts`, not scattered across implementation files.**
+All type definitions, interfaces, and type aliases for a module belong in that module's `types.ts`. Implementation files import types from `types.ts` — they do not define their own types unless the type is a private internal implementation detail used only within that file.
+
+**Rule 4 — Cross-module imports always go through the module barrel.**
+When module A imports from module B, it imports from `../module-b/index.js` — never from a specific internal file like `../module-b/parser.js`.
+
+```ts
+// ✅ Good — importing from module barrel
+import type { ParsedModelDefinition } from '../schema/index.js'
+
+// ❌ Bad — importing from internal file of another module
+import type { ParsedModelDefinition } from '../schema/types.js'
+```
+
+**Rule 5 — Within a module, import directly from the specific file.**
+Inside a module, files import directly from their siblings — never through the module's own barrel.
+
+```ts
+// ✅ Good — within schema module, parser.ts imports types directly
+import type { SchemaInput, ParsedModelDefinition } from './types.js'
+
+// ❌ Bad — circular: importing from own barrel
+import type { SchemaInput } from './index.js'
+```
+
+### 3.4 NDJSON Record Format
 
 Every line in `data.ndjson` is a complete, self-contained JSON object:
 
@@ -424,7 +514,7 @@ offset += Buffer.byteLength(serializedLine, 'utf8') + 1
 | Enums | `PascalCase` (name) + `SCREAMING_SNAKE` (values) | `ErrorCode.VALIDATION_ERROR` |
 | Constants | `SCREAMING_SNAKE_CASE` | `DEFAULT_COMPACT_THRESHOLD`, `SYSTEM_FIELDS` |
 | Files | `kebab-case` | `index-manager.ts`, `persistence.ts` |
-| Test files | mirror source with `.test.ts` suffix | `index-manager.test.ts` |
+| Test files | mirror source file name with `.test.ts` suffix | `parser.test.ts`, `mismatch.test.ts` |
 | Generic type params | `T` prefix or descriptive: `TRecord`, `TSchema` | `TRecord extends Record<string, unknown>` |
 
 ### 7.2 Domain-Specific Names
@@ -435,6 +525,7 @@ Always use these exact terms — do not invent synonyms:
 |---|---|
 | The primary in-memory lookup | `logicalIndex` |
 | The byte-offset lookup | `physicalIndex` |
+| The id-to-field-values reverse lookup | `reverseMap` |
 | Soft-deleted record | `tombstone` |
 | Record stored in NDJSON | `record` (not `row`, `entry`, `document`) |
 | Database root folder | `dbLocation` |
@@ -487,15 +578,36 @@ import { OrionDBError } from '../errors/index'
 Always use `import type` for type-only imports:
 
 ```ts
-import type { IndexManagerOptions, PrimaryKey } from './types.js'
-import { IndexManagerImpl } from './impl.js'
+import type { IndexManagerOptions, PrimaryKey } from '../index-manager/index.js'
+import { IndexManagerImpl } from '../index-manager/index.js'
 ```
 
 ### 8.4 Barrel Export Rules
 
-- `src/index.ts` is the **only** public barrel
-- Internal modules never import from `src/index.ts` — always import directly from the source module
-- The barrel exports exactly what the requirements define as public API — nothing more
+- `src/index.ts` is the **only public barrel** — it is the sole export surface for package consumers
+- Each module's internal `index.ts` is an **internal barrel** — it re-exports from sibling files within that module only
+- Internal modules never import from `src/index.ts` — always import from the target module's internal barrel
+- When importing across modules, always import from the module's internal barrel (`../schema/index.js`), never from a specific internal file (`../schema/parser.js`)
+- The public barrel exports exactly what the requirements define as public API — nothing more
+
+### 8.5 Import Path Decision Tree
+
+```
+Is the import from a Node.js built-in?
+  └─ Yes → use 'node:fs', 'node:path', etc.
+
+Is the import from an external package?
+  └─ Yes → use the package name directly
+
+Is the import from another module within src/?
+  └─ Yes → import from that module's internal barrel: '../other-module/index.js'
+
+Is the import from a sibling file within the same module?
+  └─ Yes → import directly from the sibling file: './types.js', './parser.js'
+
+Is the import from src/index.ts?
+  └─ Never — internal code never imports from the public barrel
+```
 
 ---
 
@@ -515,6 +627,11 @@ OrionDBError (base class)
 ├── RelationError             (RELATION_ERROR)
 └── CompactionError           (COMPACTION_ERROR)
 ```
+
+> **Note:** `CompactionError` is also used as a temporary structural I/O error for schema file write
+> failures (e.g. in `writeSchemaFile`) until a dedicated `StorageError` class is introduced in a
+> future pass. Any `CompactionError` thrown from schema file I/O will carry
+> `meta: { cause: originalError }` to distinguish it from true compaction failures.
 
 ### 9.2 OrionDBError Shape
 
@@ -607,50 +724,45 @@ Critical modules (errors, index-manager, persistence) should target **95%+**.
 
 ### 10.3 Test File Structure
 
+Test files mirror the source file structure exactly. Each source file has a corresponding test file:
+
+```
+src/schema/parser.ts         → tests/unit/schema/parser.test.ts
+src/schema/serializer.ts     → tests/unit/schema/serializer.test.ts
+src/schema/mismatch.ts       → tests/unit/schema/mismatch.test.ts
+src/schema/relations.ts      → tests/unit/schema/relations.test.ts
+src/persistence/writer.ts    → tests/unit/persistence/writer.test.ts
+src/persistence/reader.ts    → tests/unit/persistence/reader.test.ts
+src/persistence/compaction.ts → tests/unit/persistence/compaction.test.ts
+```
+
+Module `index.ts` barrel files are **not tested directly** — their re-exports are covered by the tests for the files they re-export from.
+
+Example test file structure:
+
 ```ts
-// tests/unit/index-manager/index-manager.test.ts
+// tests/unit/schema/parser.test.ts
 
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { IndexManagerImpl } from '../../../src/index-manager/index.js'
+import { describe, it, expect } from 'vitest'
+import { parseModelSchema } from '../../../src/schema/parser.js'
 
-describe('IndexManager', () => {
-  describe('add()', () => {
-    it('adds a record to the logical index for indexed fields', () => { ... })
-    it('adds a record to the physical index', () => { ... })
-    it('uses upsert behavior — overwrites existing entry for same id', () => { ... })
-    it('does not add non-indexed fields to the logical index', () => { ... })
+describe('parseModelSchema()', () => {
+  describe('model name validation', () => {
+    it('throws SchemaValidationError for empty model name', () => { ... })
+    it('throws SchemaValidationError for model name starting with digit', () => { ... })
+    it('accepts valid model names', () => { ... })
   })
 
-  describe('update()', () => {
-    it('removes old logical index entries for changed fields', () => { ... })
-    it('adds new logical index entries after update', () => { ... })
-    it('updates physical index to new offset', () => { ... })
+  describe('primary key validation', () => {
+    it('throws when no primary key field is defined', () => { ... })
+    it('throws when more than one primary key field is defined', () => { ... })
+    it('includes the primary key field in indexedFields', () => { ... })
   })
 
-  describe('delete()', () => {
-    it('removes entry from logical index', () => { ... })
-    it('removes entry from physical index', () => { ... })
-    it('is a no-op if id does not exist', () => { ... })
-  })
-
-  describe('getOffset()', () => {
-    it('returns byte offset for known id', () => { ... })
-    it('returns undefined for unknown id', () => { ... })
-  })
-
-  describe('getByField()', () => {
-    it('returns set of primary keys for indexed field', () => { ... })
-    it('returns undefined for non-indexed field', () => { ... })
-    it('returns undefined for unknown value', () => { ... })
-  })
-
-  describe('rebuild()', () => {
-    it('clears all existing index data before rebuilding', () => { ... })
-    it('correctly indexes non-deleted records', () => { ... })
-    it('removes tombstoned records from both indexes', () => { ... })
-    it('applies last-occurrence-wins for duplicate ids', () => { ... })
-    it('tracks byte offsets correctly', () => { ... })
-    it('discards malformed final line with console.warn', () => { ... })
+  describe('field validation', () => {
+    it('throws for reserved system field names', () => { ... })
+    it('throws for invalid field name format', () => { ... })
+    it('throws for unique constraint on boolean field', () => { ... })
   })
 })
 ```
@@ -680,18 +792,18 @@ For tests that require actual file I/O (persistence, rebuild):
 - Never write test files to the source directory
 
 ```ts
-import { mkdtempSync, rmSync } from 'node:fs'
+import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 let testDir: string
 
-beforeEach(() => {
-  testDir = mkdtempSync(join(tmpdir(), 'oriondb-test-'))
+beforeEach(async () => {
+  testDir = await fs.mkdtemp(join(tmpdir(), 'oriondb-test-'))
 })
 
-afterEach(() => {
-  rmSync(testDir, { recursive: true, force: true })
+afterEach(async () => {
+  await fs.rm(testDir, { recursive: true, force: true })
 })
 ```
 
@@ -705,7 +817,7 @@ pnpm test
 pnpm test --coverage
 
 # Run specific file
-pnpm test tests/unit/index-manager/index-manager.test.ts
+pnpm test tests/unit/schema/parser.test.ts
 
 # Watch mode
 pnpm test --watch
@@ -720,8 +832,8 @@ Features must be implemented **in this exact order**. Do not begin a feature unt
 | # | Feature | Status | Branch |
 |---|---|---|---|
 | 1 | Error System | ✅ Done | merged |
-| 2 | Index Manager | 🔄 In Progress | `feature/index-manager` |
-| 3 | Schema Definition & Validation | ⬜ Pending | `feature/schema` |
+| 2 | Index Manager | ✅ Done | merged |
+| 3 | Schema Definition & Validation | 🔄 In Progress | `feature/schema` |
 | 4 | Persistence Write (create, createMany) | ⬜ Pending | `feature/persistence-write` |
 | 5 | Persistence Read (findUnique, findFirst, findMany) | ⬜ Pending | `feature/persistence-read` |
 | 6 | Persistence Update (update, updateMany) | ⬜ Pending | `feature/persistence-update` |
@@ -755,11 +867,12 @@ The Index Manager is the core lookup acceleration layer. It maintains two in-mem
 
 - **Logical Index:** "Which record IDs match this field value?" → `Map<fieldName, Map<fieldValue, Set<primaryKey>>>`
 - **Physical Index:** "Where in the file is this record?" → `Map<primaryKey, byteOffset>`
+- **Reverse Map:** "What field values does this record currently hold?" → `Map<primaryKey, Map<fieldName, FieldValue>>` (internal — used by `delete` and `update` to avoid scanning the logical index)
 
 ### 12.2 Types
 
 ```ts
-// src/index-manager/index.ts
+// src/index-manager/types.ts
 
 export type PrimaryKey = string | number
 export type FieldValue = string | number | boolean | null
@@ -767,6 +880,7 @@ export type FieldValue = string | number | boolean | null
 export interface IndexManagerOptions {
   primaryKeyField: string           // which field is the PK (e.g. 'id')
   indexedFields: Set<string>        // only these fields enter the logical index
+                                    // MUST include the primary key field (§10.2)
 }
 
 export interface IndexManager<TRecord extends Record<string, unknown>> {
@@ -785,6 +899,7 @@ export interface IndexManager<TRecord extends Record<string, unknown>> {
 ### 12.3 Concrete Class
 
 ```ts
+// src/index-manager/index-manager.ts
 export class IndexManagerImpl<TRecord extends Record<string, unknown>>
   implements IndexManager<TRecord>
 ```
@@ -794,19 +909,23 @@ export class IndexManagerImpl<TRecord extends Record<string, unknown>>
 ```ts
 private logicalIndex: Map<string, Map<FieldValue, Set<PrimaryKey>>>
 private physicalIndex: Map<PrimaryKey, number>
+private reverseMap: Map<PrimaryKey, Map<string, FieldValue>>
 private readonly options: IndexManagerOptions
 ```
+
+- **`logicalIndex`** — field → value → set of primary keys. Tracks all fields in `options.indexedFields`, including the primary key field.
+- **`physicalIndex`** — primary key → byte offset. Only active (non-deleted) records are present.
+- **`reverseMap`** — primary key → (field name → field value). Maintained for every record in `physicalIndex`. Enables O(1) reverse lookup during `delete` and `update` without scanning the logical index.
 
 ### 12.5 Method Contracts
 
 #### `add(record, offset)`
 
 - Extracts `id` from `record[options.primaryKeyField]`
-- For each field in `options.indexedFields`: update `logicalIndex[field][value]` to include this id
+- For each field in `options.indexedFields` (which includes the PK field): update `logicalIndex[field][value]` to include this id
+- Update `reverseMap[id]` with the current field values for all indexed fields
 - Update `physicalIndex[id] = offset`
-- **Upsert behavior:** if id already exists, overwrite both indexes (required for rebuild)
-- PK field is implicitly indexed in physical index always
-- PK field is NOT added to logical index (physical index covers PK lookups)
+- **Upsert behavior:** if id already exists, overwrite all three structures (required for rebuild)
 
 #### `update(oldRecord, newRecord, newOffset)`
 
@@ -815,22 +934,20 @@ private readonly options: IndexManagerOptions
   - Remove `id` from `logicalIndex[field][oldValue]`
   - If the old value's Set is now empty, delete the Set from the Map
   - Add `id` to `logicalIndex[field][newValue]`
+- Update `reverseMap[id]` with new field values
 - Update `physicalIndex[id] = newOffset`
-- Order: logical first, physical last
+- **Order: logical index first, reverse map second, physical index last**
 
 #### `delete(id)`
 
+- Look up current field values from `reverseMap[id]`
 - For each field in `options.indexedFields`:
-  - Find the value of that field for this id — this requires either the record or scanning
-  - **Implementation note:** store record snapshot or iterate logical index
-  - Remove `id` from the relevant Set
-  - If Set is now empty, delete it from the Map
+  - Remove `id` from `logicalIndex[field][currentValue]`
+  - If the Set is now empty, delete it from the Map
+- Delete `reverseMap[id]`
 - Delete `physicalIndex[id]`
-- No-op if `id` does not exist
-
-> **Implementation note for delete:** The logical index structure (field→value→ids) makes reverse lookup (id→values) non-trivial. Two recommended approaches:
-> 1. Keep a reverse map: `Map<PrimaryKey, Map<fieldName, FieldValue>>` — most efficient
-> 2. Scan logical index during delete — acceptable at Phase 1 dataset sizes
+- No-op if `id` does not exist in `physicalIndex`
+- **Order: logical index first, reverse map second, physical index last**
 
 #### `getOffset(id)`
 
@@ -845,6 +962,7 @@ private readonly options: IndexManagerOptions
 
 - `logicalIndex.clear()`
 - `physicalIndex.clear()`
+- `reverseMap.clear()`
 
 #### `rebuild(filePath)`
 
@@ -853,14 +971,18 @@ private readonly options: IndexManagerOptions
 3. Track `currentOffset = 0`
 4. For each line:
    a. Try `JSON.parse(line)`
-   b. On parse failure: check if this is the **last line** — if yes, `console.warn` and discard; if not the last line, throw `ValidationError`
+   b. On parse failure on the **last line only**: `console.warn` and discard. Parse failures on any other line are an unexpected condition — log a warning and skip the line (do not throw, as the file may have been written by an older version)
    c. Extract id and `_deleted` flag
-   d. If `_deleted === true`: call `this.delete(id)` (removes from both indexes if present)
+   d. If `_deleted === true`: call `this.delete(id)` (removes from all three structures if present)
    e. If `_deleted === false`: call `this.add(record, currentOffset)` (upsert — last occurrence wins)
    f. Increment: `currentOffset += Buffer.byteLength(line, 'utf8') + 1`
 5. Resolve promise
 
-> **Critical:** The byte offset recorded for a record is the offset of the **start** of its line, not after. Step (f) increments **after** recording the offset in step (e).
+> **Critical:** The byte offset recorded for a record is the offset of the **start** of its line, not
+> after. Step (f) increments **after** recording the offset in step (e).
+
+> **Note on newline length:** The `+1` in step (f) assumes a single `\n` newline. Windows `\r\n`
+> line endings are not supported in Phase 1. NDJSON files written by OrionDB always use `\n`.
 
 #### `has(id)`
 
@@ -872,13 +994,14 @@ private readonly options: IndexManagerOptions
 
 ### 12.6 Index Update Ordering Rule
 
-This order is **mandatory** in all write operations:
+This order is **mandatory** in all write operations (`add` uses upsert so ordering is implicit, but `update` and `delete` must follow this strictly):
 
 1. Validate inputs first — no index mutation until validation passes
 2. Update **logical index** first
-3. Update **physical index** last
+3. Update **reverse map** second
+4. Update **physical index** last
 
-Rationale: physical index inconsistency (wrong offset) causes corrupted reads, which is more dangerous than temporarily stale logical index entries.
+Rationale: physical index inconsistency (wrong or stale offset) causes corrupted reads, which is more dangerous than temporarily stale logical index or reverse map entries. JavaScript's single-threaded execution model prevents async interruption between these synchronous Map operations.
 
 ### 12.7 Test Coverage Requirements for Index Manager
 
@@ -890,6 +1013,8 @@ Every method must have tests for:
 - Edge case: last-occurrence-wins (rebuild with duplicates)
 - Edge case: malformed final line (rebuild)
 - Edge case: non-indexed field ignored in logical index
+- Edge case: primary key field present in logical index
+- Edge case: reverse map correctly updated on add, update, and delete
 
 ---
 
@@ -909,7 +1034,18 @@ const User = db.model('User', {
 })
 ```
 
-### 13.2 Field Types
+### 13.2 File Responsibilities within `src/schema/`
+
+| File | Responsibility |
+|---|---|
+| `types.ts` | All schema type definitions: `FieldDefinition`, `ParsedModelDefinition`, `PersistedSchema`, `SchemaDiff`, etc. |
+| `parser.ts` | `parseModelSchema` — parses and validates a single model's raw schema input |
+| `serializer.ts` | `serializeSchema`, `deserializeSchema`, `readSchemaFile`, `writeSchemaFile` |
+| `mismatch.ts` | `diffSchemas`, `applyMismatchStrategy`, `validateSchema`, `runStartupSchemaValidation` |
+| `relations.ts` | `validateRelationships`, `validateForeignKeyExists` — cross-model consistency |
+| `index.ts` | Re-exports only — no logic |
+
+### 13.3 Field Types
 
 | Type | TS Type | Storage | Notes |
 |---|---|---|---|
@@ -920,14 +1056,15 @@ const User = db.model('User', {
 | `json` | `Record<string, unknown>` | JSON object | No deep validation |
 | `enum` | `string` (union) | JSON string | Validated against declared values |
 
-### 13.3 Primary Key Rules
+### 13.4 Primary Key Rules
 
 - Every model **must** have exactly one `primary: true` field
 - PK field is engine-managed (not processed by general default logic)
 - Duplicate PK on insert → `UniqueConstraintError`
 - Missing PK with no default → `ValidationError`
+- The primary key field is always included in `indexedFields` and is therefore always tracked in the logical index (§10.2)
 
-### 13.4 Schema Mismatch Detection
+### 13.5 Schema Mismatch Detection
 
 Comparison on startup between `_schema.json` (disk) and code-defined schema.
 
@@ -938,41 +1075,64 @@ Comparison on startup between `_schema.json` (disk) and code-defined schema.
 |---|---|
 | `block` (default) | Throw `SchemaMismatchError` with full diff |
 | `warn-and-continue` | Log warning, proceed with code schema |
-| `auto-migrate` | Apply additive changes; destructive changes throw |
+| `auto-migrate` | Apply additive changes; destructive changes always throw |
 
-**Safe additive changes:** new optional field with default, new model, new enum value  
-**Always destructive:** removing a field, changing a field type, removing enum value, changing PK field
+**Safe additive changes (auto-migrate and warn-and-continue):**
+- New optional field with a default value
+- New model
+- New enum value added to an existing enum field
+- Adding a `unique` constraint to an existing field
 
-### 13.5 Relationship Validation (Always Hard Error)
+**Always destructive — always throw `SchemaMismatchError` regardless of strategy:**
+- Removing a field
+- Changing a field's type
+- Removing an enum value
+- Removing a `unique` constraint from an existing field
+- Changing a field from optional to required with no default
+- Removing a model
+- Changing the primary key field
+
+### 13.6 Relationship Validation (Always Hard Error)
 
 Validated before `schemaMismatchStrategy` is applied:
 - Model A declares relation to Model B → B must exist
-- `foreignKey: 'authorId'` → `authorId` must be a field on the referenced model
-- Bidirectional relation must be declared consistently on both sides
+- `foreignKey: 'authorId'` → `authorId` must be a scalar field on the model that holds the FK
+- Bidirectional relation must be declared consistently on both sides — both sides must be present; a unidirectional declaration (only one side) is a `SchemaValidationError`
 
 ---
 
 ## 14. Persistence Layer — Deep Spec
 
-### 14.1 Write Path (create)
+### 14.1 File Responsibilities within `src/persistence/`
+
+| File | Responsibility |
+|---|---|
+| `types.ts` | All persistence-related type definitions |
+| `writer.ts` | Append logic, unique constraint checks, in-memory file size counter, `create`/`createMany`/`update`/`updateMany` write paths |
+| `reader.ts` | Indexed lookup (physical index + `fs.read`), full scan via `readline`, system field stripping |
+| `compaction.ts` | Compaction algorithm, compaction lock, write queue during compaction |
+| `index.ts` | Re-exports only — no logic |
+
+### 14.2 Write Path (create)
 
 ```
 1.  Validate record against schema
 2.  Apply defaults for missing optional fields
 3.  Check unique constraints via logical index
 4.  Serialize: JSON.stringify(record) + '\n'
-5.  Get currentOffset from in-memory file size counter (NEVER fs.stat)
+5.  Get currentOffset from in-memory file size counter (NEVER fs.stat on the write path)
 6.  fs.appendFile(filePath, serializedLine)
 7.  Update logical index (indexed fields)
-8.  Update physical index (id → currentOffset)
-9.  Increment counter: counter += Buffer.byteLength(serializedLine, 'utf8')
-10. Update meta.json counters
-11. Return record to caller
+8.  Update reverse map
+9.  Update physical index (id → currentOffset)
+10. Increment counter: counter += Buffer.byteLength(serializedLine, 'utf8')
+11. Update meta.json counters
+12. Return record to caller
 ```
 
-**Critical:** Step 5 uses the in-memory counter, not a fresh `fs.stat`. Counter is initialized on startup from actual file size and kept in sync through all write operations.
+**Critical:** Step 5 uses the in-memory counter, not a fresh `fs.stat`. The counter is initialized once at startup from the actual file size and kept in sync through all write operations. `fs.stat` is never called on the write path.
 
-### 14.2 Read Path — Indexed Lookup (findUnique by PK or unique field)
+### 14.3 Read Path — Indexed Lookup (findUnique by PK or unique field)
 
 ```
 1. Logical index lookup → primary key       O(1)
@@ -984,7 +1144,7 @@ Validated before `schemaMismatchStrategy` is applied:
 7. Return record
 ```
 
-### 14.3 Read Path — Full Scan (findMany with non-indexed filter)
+### 14.4 Read Path — Full Scan (findMany with non-indexed filter)
 
 ```
 1. readline stream over data.ndjson
@@ -997,7 +1157,7 @@ Validated before `schemaMismatchStrategy` is applied:
 8. Return results
 ```
 
-### 14.4 Delete Path
+### 14.5 Delete Path
 
 ```
 1. Validate record exists via physical index
@@ -1005,18 +1165,19 @@ Validated before `schemaMismatchStrategy` is applied:
 3. Create tombstone: { ...record, _deleted: true, _updatedAt: now }
 4. fs.appendFile(filePath, JSON.stringify(tombstone) + '\n')
 5. Remove from logical index
-6. Remove from physical index
-7. Increment tombstone counter in meta.json
+6. Remove from reverse map
+7. Remove from physical index
+8. Increment tombstone counter in meta.json
 ```
 
-### 14.5 File Size Counter
+### 14.6 File Size Counter
 
-- Initialized on startup from `(await fs.stat(filePath)).size`
+- Initialized **once at startup** from `(await fs.stat(filePath)).size` — this is the only permitted `fs.stat` call
 - Incremented after every append by `Buffer.byteLength(line, 'utf8')`
-- Reset after compaction from new file's actual size
-- **Never call `fs.stat` on the hot write path**
+- Reset after compaction from the new file's actual size via a single `fs.stat` call post-compaction
+- **Never call `fs.stat` on the hot write path** — the counter must already reflect current file size
 
-### 14.6 System Field Handling
+### 14.7 System Field Handling
 
 - System fields (`_deleted`, `_createdAt`, `_updatedAt`) are always written to disk
 - System fields are **always stripped** before returning records to the caller
@@ -1026,7 +1187,18 @@ Validated before `schemaMismatchStrategy` is applied:
 
 ## 15. Query Engine — Deep Spec
 
-### 15.1 Supported Operations
+### 15.1 File Responsibilities within `src/query/`
+
+| File | Responsibility |
+|---|---|
+| `types.ts` | All query-related type definitions: `WhereClause`, `OrderByClause`, `SelectClause`, etc. |
+| `filter.ts` | `where` clause evaluation, all scalar and logical operator implementations |
+| `sort.ts` | `orderBy` — single and multi-field sort |
+| `pagination.ts` | `skip` / `take` logic, early-exit enforcement |
+| `aggregations.ts` | `count`, `aggregate`, `groupBy` |
+| `index.ts` | Re-exports only — no logic |
+
+### 15.2 Supported Operations
 
 | Operation | Description |
 |---|---|
@@ -1044,7 +1216,7 @@ Validated before `schemaMismatchStrategy` is applied:
 | `aggregate` | Filter scan → compute `_count`, `_avg`, `_sum`, `_min`, `_max` |
 | `groupBy` | Filter scan → group by field → aggregate per group |
 
-### 15.2 Where Operators
+### 15.3 Where Operators
 
 | Operator | Types | Example |
 |---|---|---|
@@ -1063,7 +1235,7 @@ Validated before `schemaMismatchStrategy` is applied:
 | `OR` | logical | `{ OR: [{...}, {...}] }` |
 | `NOT` | logical | `{ NOT: { status: 'banned' } }` |
 
-### 15.3 select + include Rules
+### 15.4 select + include Rules
 
 - `select` and `include` **cannot be used at the same level** → throws `QueryError`
 - To include a relation while selecting scalar fields, nest inside `select`:
@@ -1076,7 +1248,7 @@ select: { name: true, posts: { select: { title: true } } }
 select: { name: true }, include: { posts: true }
 ```
 
-### 15.4 Performance Characteristics
+### 15.5 Performance Characteristics
 
 | Operation | Complexity |
 |---|---|
@@ -1091,7 +1263,16 @@ select: { name: true }, include: { posts: true }
 
 ## 16. Relationship Resolver — Deep Spec
 
-### 16.1 Supported Relationship Types (Phase 1)
+### 16.1 File Responsibilities within `src/relations/`
+
+| File | Responsibility |
+|---|---|
+| `types.ts` | Relation resolver type definitions |
+| `resolver.ts` | Batched `include` resolution — N+1 prevention |
+| `nested-writes.ts` | Nested `create` and `update` logic |
+| `index.ts` | Re-exports only — no logic |
+
+### 16.2 Supported Relationship Types (Phase 1)
 
 | Type | Example |
 |---|---|
@@ -1100,7 +1281,7 @@ select: { name: true }, include: { posts: true }
 
 Many-to-Many is Phase 2.
 
-### 16.2 N+1 Prevention — Batched Resolution (Hard Requirement)
+### 16.3 N+1 Prevention — Batched Resolution (Hard Requirement)
 
 `include` clauses must use batched resolution. Per-record lookups are **not acceptable**.
 
@@ -1114,7 +1295,7 @@ Many-to-Many is Phase 2.
 
 Example: `db.user.findMany({ include: { posts: true } })` returning 1000 users must trigger **exactly one** post scan — never 1000 separate lookups.
 
-### 16.3 Nested Writes
+### 16.4 Nested Writes
 
 Supported on `create` and `update`. Implemented **last** in the sequence after flat CRUD is stable.
 
@@ -1157,14 +1338,14 @@ Auto-check runs after every `delete` and `deleteMany`.
 4.  Write to data.ndjson.tmp
 5.  Queue all incoming writes (operation-level queue)
 6.  fs.rename(data.ndjson.tmp, data.ndjson)  ← atomic
-7.  Rebuild BOTH logical and physical indexes from new file
-8.  Reset file size counter from actual new file size
+7.  Rebuild ALL three indexes (logical, reverse map, physical) from new file
+8.  Reset file size counter from actual new file size (single fs.stat call)
 9.  Flush queued writes in order
 10. Update meta.json
 11. Release compaction lock
 ```
 
-**All physical index entries are invalidated by compaction.** Every record is at a new offset in the compacted file. Full index rebuild is mandatory.
+**All physical index entries are invalidated by compaction.** Every record is at a new offset in the compacted file. Full index rebuild (all three structures) is mandatory.
 
 **Reads are not blocked during compaction.** Writes are queued at operation granularity.
 
@@ -1253,7 +1434,7 @@ These are **hard requirements**, not aspirational targets:
 1. **The append log is the source of truth.** Last valid occurrence of a record ID in `data.ndjson` = current state.
 2. **Last occurrence wins during rebuild.** Each new occurrence of an ID overwrites the previous index entry.
 3. **Tombstones are not permanent.** A write after a tombstone resurrects the record — this is correct append-only log behavior.
-4. **Only indexed fields are tracked in the logical index.**
+4. **Only indexed fields are tracked in the logical index.** The primary key field is always in `indexedFields` and is therefore always tracked.
 
 ### 20.2 Crash Consistency (Phase 1 Documented Limits)
 
@@ -1276,8 +1457,8 @@ Full crash atomicity (WAL) is Phase 2.
     b. Apply schemaMismatchStrategy on mismatch
 5.  Create model directories if not exists
 6.  For each model:
-    a. fs.stat(data.ndjson) → initialize in-memory file size counter
-    b. readline stream → rebuild logical + physical indexes
+    a. fs.stat(data.ndjson) → initialize in-memory file size counter (startup only)
+    b. readline stream → rebuild logical index, reverse map, and physical index
     c. Last occurrence wins; discard malformed final line with console.warn
 7.  Write updated _schema.json
 8.  Write _meta.json if not exists
@@ -1328,14 +1509,18 @@ chore/<short-description>     ← non-functional changes (deps, config, docs)
 <type>(<scope>): <short summary>
 
 Types: feat | fix | test | refactor | chore | docs | build | ci
-Scope: index-manager | schema | persistence | query | relations | errors | compaction | client | api
+Scope: index-manager | schema | persistence | query | relations | errors | client | api
 
 Examples:
-feat(index-manager): implement IndexManagerImpl with logical and physical indexes
-test(index-manager): add full test coverage for rebuild and tombstone handling
+feat(schema): implement parseModelSchema with full field validation
+test(schema): add parser and mismatch detection test coverage
 fix(persistence): correct byte offset tracking after compaction reset
 chore(deps): upgrade vitest to 1.6.0
 ```
+
+> **Note on scope:** Compaction is implemented inside `src/persistence/compaction.ts`. Use the
+> `persistence` scope for compaction-related commits
+> (e.g. `feat(persistence): implement non-blocking compaction`).
 
 ### 22.3 PR Rules
 
@@ -1361,9 +1546,11 @@ A feature branch is **complete and mergeable** when ALL of the following are tru
 - [ ] All imports use `node:` prefix for Node built-ins
 - [ ] All relative imports use `.js` extension
 - [ ] No runtime dependencies added without explicit justification
+- [ ] No logic inside any module's `index.ts` barrel file
+- [ ] Each source file has a corresponding test file
 - [ ] PR description summarizes what was implemented and links to relevant spec sections
 
 ---
 
 *End of OrionDB Developer Instructions*  
-*This document must be updated when architectural decisions change.*  
+*This document must be updated when architectural decisions change.*

@@ -4,6 +4,7 @@ import { access } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 import { ValidationError } from "../errors/ValidationError.js";
+import { QueryError } from "../errors/QueryError.js";
 
 export type PrimaryKey = string | number;
 
@@ -67,7 +68,10 @@ export class IndexManagerImpl<TRecord extends Record<string, unknown>> implement
   add(record: TRecord, offset: number): void {
     const id = record[this.options.primaryKeyField];
     if (!isValidPrimaryKey(id)) {
-      return;
+      throw new ValidationError(
+        `Invalid primary key for field "${this.options.primaryKeyField}": expected string or number, got ${typeof id}`,
+        { meta: { value: id } },
+      );
     }
 
     // Logical index — update first (per spec section 12.6)
@@ -110,6 +114,14 @@ export class IndexManagerImpl<TRecord extends Record<string, unknown>> implement
     const id = newRecord[this.options.primaryKeyField];
     if (!isValidPrimaryKey(id)) {
       return;
+    }
+
+    const oldId = oldRecord[this.options.primaryKeyField];
+    if (oldId !== id) {
+      throw new ValidationError(
+        `Primary key mutation is not supported. Cannot change "${this.options.primaryKeyField}" from ${String(oldId)} to ${String(id)}`,
+        { meta: { oldId, newId: id } },
+      );
     }
 
     // Logical index — update first
@@ -208,6 +220,11 @@ export class IndexManagerImpl<TRecord extends Record<string, unknown>> implement
    * have that value (never returns an empty Set).
    */
   getByField(field: string, value: FieldValue): Set<PrimaryKey> | undefined {
+    if (field === this.options.primaryKeyField) {
+      throw new QueryError(
+        `Field "${field}" is the primary key and is not queryable via the logical index. Use getOffset() instead.`,
+      );
+    }
     if (!this.options.indexedFields.has(field)) {
       return undefined;
     }
@@ -246,13 +263,68 @@ export class IndexManagerImpl<TRecord extends Record<string, unknown>> implement
           });
 
           let currentOffset = 0;
-          // Track lines as [lineContent, startOffset] so we can detect the last line
-          // and handle malformed-final-line vs malformed-mid-file differently.
-          const lines: Array<{ line: string; offset: number }> = [];
+          let lineNumber = 0;
+          // Previous-line lookahead: hold the last seen line until the next line (or close)
+          // arrives so we always know whether the current line is the final one.
+          type PendingLine = { line: string; offset: number; num: number };
+          let pending: PendingLine | undefined = undefined;
+
+          const processLine = (line: string, offset: number, num: number, isFinal: boolean): void => {
+            let parsed: unknown;
+            try {
+              parsed = JSON.parse(line);
+            } catch {
+              console.warn(
+                `[OrionDB] Malformed ${isFinal ? "final " : ""}line ${num} in ${filePath} — discarding.` +
+                  (isFinal ? " This may indicate an incomplete write." : "") +
+                  ` Content: ${line}`,
+              );
+              return;
+            }
+
+            if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+              console.warn(
+                `[OrionDB] Non-object record on ${isFinal ? "final " : ""}line ${num} in ${filePath} — discarding.`,
+              );
+              return;
+            }
+
+            const record = parsed as Record<string, unknown>;
+            const id = record[this.options.primaryKeyField];
+
+            if (!isValidPrimaryKey(id)) {
+              console.warn(
+                `[OrionDB] Invalid primary key on line ${num} in ${filePath} at offset ${offset} — skipping.`,
+              );
+              return;
+            }
+
+            if (record["_deleted"] === true) {
+              this.delete(id);
+            } else {
+              try {
+                this.add(record as TRecord, offset);
+              } catch (err: unknown) {
+                if (err instanceof ValidationError) {
+                  console.warn(
+                    `[OrionDB] Corrupt record at offset ${offset} in ${filePath} (line ${num}) — skipping. ${err.message}`,
+                  );
+                  return;
+                }
+                throw err;
+              }
+            }
+          };
 
           rl.on("line", (line: string) => {
-            lines.push({ line, offset: currentOffset });
+            lineNumber++;
+            const lineOffset = currentOffset;
             currentOffset += Buffer.byteLength(line, "utf8") + 1;
+
+            if (pending !== undefined) {
+              processLine(pending.line, pending.offset, pending.num, false);
+            }
+            pending = { line, offset: lineOffset, num: lineNumber };
           });
 
           rl.on("error", (err: unknown) => {
@@ -261,54 +333,8 @@ export class IndexManagerImpl<TRecord extends Record<string, unknown>> implement
 
           rl.on("close", () => {
             try {
-              for (let i = 0; i < lines.length; i++) {
-                const entry = lines[i];
-                if (entry === undefined) {
-                  continue;
-                }
-                const { line, offset } = entry;
-                const isLastLine = i === lines.length - 1;
-
-                let parsed: unknown;
-                try {
-                  parsed = JSON.parse(line);
-                } catch {
-                  if (isLastLine) {
-                    console.warn(
-                      `[OrionDB] Malformed final line in ${filePath} (line ${i + 1}) — discarding. ` +
-                        `This may indicate an incomplete write. Content: ${line}`,
-                    );
-                    continue;
-                  }
-                  throw new ValidationError(`Malformed NDJSON on line ${i + 1} in ${filePath}: ${line}`, {
-                    meta: { lineNumber: i + 1, content: line },
-                  });
-                }
-
-                if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-                  if (isLastLine) {
-                    console.warn(
-                      `[OrionDB] Non-object record on final line in ${filePath} (line ${i + 1}) — discarding.`,
-                    );
-                    continue;
-                  }
-                  throw new ValidationError(`Non-object record on line ${i + 1} in ${filePath}: ${line}`, {
-                    meta: { lineNumber: i + 1, content: line },
-                  });
-                }
-
-                const record = parsed as Record<string, unknown>;
-                const id = record[this.options.primaryKeyField];
-
-                if (!isValidPrimaryKey(id)) {
-                  continue;
-                }
-
-                if (record["_deleted"] === true) {
-                  this.delete(id);
-                } else {
-                  this.add(record as TRecord, offset);
-                }
+              if (pending !== undefined) {
+                processLine(pending.line, pending.offset, pending.num, true);
               }
               resolve();
             } catch (err: unknown) {

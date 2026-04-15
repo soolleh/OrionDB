@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { IndexManagerImpl } from "../../../src/index-manager/index.js";
 import type { IndexManagerOptions } from "../../../src/index-manager/index.js";
+import { ValidationError, QueryError } from "../../../src/errors/index.js";
 
 // ---------------------------------------------------------------------------
 // Shared fixtures
@@ -46,10 +47,11 @@ describe("IndexManager", () => {
       expect(manager.getByField("status", "active")).toEqual(new Set(["id-1"]));
     });
 
-    it("does NOT add the primary key field itself to the logical index", () => {
+    it("does NOT add the primary key field itself to the logical index — getByField() throws QueryError for PK field", () => {
       manager.add(RECORD_1, 0);
 
-      expect(manager.getByField("id", "id-1")).toBeUndefined();
+      // The PK field is not queryable via getByField() — it must throw QueryError
+      expect(() => manager.getByField("id", "id-1")).toThrowError(QueryError);
     });
 
     it("does NOT add fields outside indexedFields to the logical index", () => {
@@ -131,10 +133,10 @@ describe("IndexManager", () => {
       expect(numericManager.getByField("email", "num@example.com")).toEqual(new Set([99]));
     });
 
-    it("skips records whose primary key is not a string or number — does not throw", () => {
+    it("throws ValidationError when the primary key is not a string or number", () => {
       const record: TestRecord = { id: { nested: "object" }, email: "x@x.com", status: "active" };
 
-      expect(() => manager.add(record, 0)).not.toThrow();
+      expect(() => manager.add(record, 0)).toThrowError(ValidationError);
       expect(manager.size()).toBe(0);
     });
 
@@ -146,8 +148,8 @@ describe("IndexManager", () => {
       const pkManager = new IndexManagerImpl<TestRecord>(optionsWithPkInIndexed);
       pkManager.add(RECORD_1, 0);
 
-      // 'id' field must NOT appear in the logical index — physical index covers PK lookups
-      expect(pkManager.getByField("id", "id-1")).toBeUndefined();
+      // 'id' is the PK field — getByField() must throw QueryError for it
+      expect(() => pkManager.getByField("id", "id-1")).toThrowError(QueryError);
       // 'email' field must still be indexed
       expect(pkManager.getByField("email", "alice@example.com")).toEqual(new Set(["id-1"]));
     });
@@ -230,6 +232,12 @@ describe("IndexManager", () => {
       manager.add(RECORD_3, 50); // status: 'active'
 
       expect(manager.getByField("status", "active")).toEqual(new Set(["id-1", "id-3"]));
+    });
+
+    it("throws QueryError when called with the primary key field name", () => {
+      manager.add(RECORD_1, 0);
+
+      expect(() => manager.getByField("id", "id-1")).toThrowError(QueryError);
     });
 
     it("returns undefined for a field not in indexedFields", () => {
@@ -344,11 +352,12 @@ describe("IndexManager", () => {
       expect(manager.getByField("email", "alice@example.com")).toEqual(new Set(["id-1"]));
     });
 
-    it("skips records whose primary key is not a string or number — does not throw", () => {
+    it("throws ValidationError when new record primary key is a valid type but differs from old record PK (invalid type)", () => {
       const invalid: TestRecord = { id: { nested: "bad" }, email: "x@x.com", status: "active" };
       const valid: TestRecord = { ...RECORD_2 };
 
-      expect(() => manager.update(invalid, valid, 0)).not.toThrow();
+      // old PK = { nested: 'bad' }, new PK = 'id-2' — they differ → throws ValidationError
+      expect(() => manager.update(invalid, valid, 0)).toThrowError(ValidationError);
     });
 
     it("handles an old record whose indexed field value is not a valid FieldValue type", () => {
@@ -629,16 +638,76 @@ describe("IndexManager", () => {
       expect(manager.size()).toBe(0);
     });
 
-    it("throws ValidationError for a malformed non-final line", async () => {
+    it("emits console.warn for a malformed non-final line and resolves successfully", async () => {
       const validRecord = { id: "id-1", email: "alice@example.com", status: "active", _deleted: false };
       writeFileSync(filePath, "NOT VALID JSON\n" + JSON.stringify(validRecord) + "\n");
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
-      await expect(manager.rebuild(filePath)).rejects.toMatchObject({
-        code: "VALIDATION_ERROR",
-      });
+      await expect(manager.rebuild(filePath)).resolves.toBeUndefined();
+      expect(warnSpy).toHaveBeenCalledOnce();
+      warnSpy.mockRestore();
     });
 
-    it("handles an empty file (zero bytes) without error", async () => {
+    it("continues indexing records after a corrupt mid-file line", async () => {
+      const validRecord = { id: "id-1", email: "alice@example.com", status: "active", _deleted: false };
+      writeFileSync(filePath, "NOT VALID JSON\n" + JSON.stringify(validRecord) + "\n");
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      await manager.rebuild(filePath);
+      warnSpy.mockRestore();
+
+      // The valid record after the corrupt line must still be indexed
+      expect(manager.has("id-1")).toBe(true);
+      expect(manager.size()).toBe(1);
+    });
+
+    it("emits console.warn for a non-object value (e.g. array) on a non-final line and resolves", async () => {
+      const validRecord = { id: "id-1", email: "alice@example.com", status: "active", _deleted: false };
+      writeFileSync(filePath, JSON.stringify([1, 2, 3]) + "\n" + JSON.stringify(validRecord) + "\n");
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      await expect(manager.rebuild(filePath)).resolves.toBeUndefined();
+      expect(warnSpy).toHaveBeenCalledOnce();
+      warnSpy.mockRestore();
+
+      // Valid record after the non-object line must be indexed
+      expect(manager.has("id-1")).toBe(true);
+    });
+
+    it("warns and skips a line with invalid PK then continues indexing subsequent valid records", async () => {
+      const invalidPk = { id: { nested: "bad" }, email: "x@x.com", status: "active", _deleted: false };
+      const validRecord = { id: "id-2", email: "bob@example.com", status: "active", _deleted: false };
+      writeFileSync(filePath, JSON.stringify(invalidPk) + "\n" + JSON.stringify(validRecord) + "\n");
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      await manager.rebuild(filePath);
+      warnSpy.mockRestore();
+
+      expect(manager.size()).toBe(1);
+      expect(manager.has("id-2")).toBe(true);
+    });
+
+    it("correctly rebuilds a file with many records — streaming correctness verified via offsets", async () => {
+      const records = Array.from({ length: 25 }, (_, i) => ({
+        id: `id-${i}`,
+        email: `user${i}@example.com`,
+        status: i % 2 === 0 ? "active" : "inactive",
+        _deleted: false,
+      }));
+      const content = records.map((r) => JSON.stringify(r) + "\n").join("");
+      writeFileSync(filePath, content);
+
+      await manager.rebuild(filePath);
+
+      expect(manager.size()).toBe(25);
+      let offset = 0;
+      for (const record of records) {
+        expect(manager.getOffset(record.id)).toBe(offset);
+        offset += Buffer.byteLength(JSON.stringify(record) + "\n", "utf8");
+      }
+    });
+
+    it("handles an empty file (zero bytes) — resolves immediately without error", async () => {
       writeFileSync(filePath, "");
 
       await expect(manager.rebuild(filePath)).resolves.toBeUndefined();
@@ -655,17 +724,6 @@ describe("IndexManager", () => {
       expect(manager.size()).toBe(0);
     });
 
-    it("skips records whose primary key is not a string or number during rebuild", async () => {
-      const invalidPk = { id: { nested: "bad" }, email: "x@x.com", status: "active", _deleted: false };
-      const validRecord = { id: "id-2", email: "bob@example.com", status: "active", _deleted: false };
-      writeFileSync(filePath, JSON.stringify(invalidPk) + "\n" + JSON.stringify(validRecord) + "\n");
-
-      await manager.rebuild(filePath);
-
-      expect(manager.size()).toBe(1);
-      expect(manager.has("id-2")).toBe(true);
-    });
-
     it("emits console.warn and resolves for a non-object value (e.g. array) as the final line", async () => {
       const record = { id: "id-1", email: "alice@example.com", status: "active", _deleted: false };
       // Write a valid record then a JSON array as the last line (valid JSON but not an object)
@@ -680,21 +738,24 @@ describe("IndexManager", () => {
       expect(manager.size()).toBe(1);
     });
 
-    it("throws ValidationError for a non-object value (e.g. array) on a non-final line", async () => {
-      const validRecord = { id: "id-1", email: "alice@example.com", status: "active", _deleted: false };
-      // Array is valid JSON but not a plain object — non-final line must throw ValidationError
-      writeFileSync(filePath, JSON.stringify([1, 2, 3]) + "\n" + JSON.stringify(validRecord) + "\n");
-
-      await expect(manager.rebuild(filePath)).rejects.toMatchObject({
-        code: "VALIDATION_ERROR",
-      });
-    });
-
     it("rejects when the underlying stream emits an I/O error", async () => {
       // Pointing rebuild at a directory: access() succeeds (directory exists via F_OK)
       // but createReadStream on a directory emits an EISDIR error on the stream,
       // which readline propagates through the rl.on("error") handler.
       await expect(manager.rebuild(testDir)).rejects.toBeInstanceOf(Error);
+    });
+
+    it("rejects when add() throws an unexpected non-ValidationError during rebuild", async () => {
+      const record = { id: "id-1", email: "alice@example.com", status: "active", _deleted: false };
+      writeFileSync(filePath, JSON.stringify(record) + "\n");
+
+      const unexpectedError = new Error("Unexpected internal error");
+      // Spy on add() to throw a generic Error (not a ValidationError) for this one call
+      vi.spyOn(manager, "add").mockImplementationOnce(() => {
+        throw unexpectedError;
+      });
+
+      await expect(manager.rebuild(filePath)).rejects.toBe(unexpectedError);
     });
   });
 });
