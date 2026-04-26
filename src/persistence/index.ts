@@ -10,6 +10,9 @@ export type {
   ModelWriterContext,
   CreateManyArgs,
   CreateManyResult,
+  UpdateArgs,
+  UpdateManyArgs,
+  UpdateManyResult,
   RawRecord,
   SelectClause,
   FindUniqueArgs,
@@ -50,6 +53,6 @@ export {
 
 export { FileSizeCounter, FileSizeCounterManager } from "./file-size-counter.js";
 
-export { create, createMany, stripSystemFields, deleteRecord, deleteMany } from "./writer.js";
+export { create, createMany, update, updateMany, stripSystemFields, deleteRecord, deleteMany } from "./writer.js";
 
-export { findUnique, findUniqueOrThrow, findMany, findFirst } from "./reader.js";
+export { readRecordAtOffset, findUnique, findUniqueOrThrow, findMany, findFirst } from "./reader.js";

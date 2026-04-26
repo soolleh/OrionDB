@@ -128,6 +128,29 @@ export interface CreateManyResult {
   count: number;
 }
 
+/**
+ * Arguments for the update() write operation.
+ */
+export interface UpdateArgs {
+  where: Record<string, unknown>;
+  data: Record<string, unknown>;
+}
+
+/**
+ * Arguments for the updateMany() write operation.
+ */
+export interface UpdateManyArgs {
+  where?: WhereClause;
+  data: Record<string, unknown>;
+}
+
+/**
+ * Result returned from an updateMany() operation.
+ */
+export interface UpdateManyResult {
+  count: number;
+}
+
 // ---------------------------------------------------------------------------
 // Reader types
 // ---------------------------------------------------------------------------
@@ -211,6 +234,19 @@ export interface ScanOptions {
   skip?: number;
   /** Sort clause — stored in result but not applied by the scan engine. */
   orderBy?: OrderByClause;
+  /**
+   * Primary key field name — must be provided when `isLive` is provided.
+   * Used to extract the record ID for the offset deduplication check.
+   */
+  pkField?: string;
+  /**
+   * Optional live-record check for append-only log deduplication.
+   * When provided, the scan tracks each line's byte offset and calls this
+   * function to determine whether the line is the current canonical version
+   * of the record (i.e. its offset matches the physical index entry).
+   * Returns `true` to include the record, `false` to skip it (old version or deleted).
+   */
+  isLive?: (id: unknown, lineStartOffset: number) => boolean;
 }
 
 /**

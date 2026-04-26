@@ -67,8 +67,9 @@ export async function readRecordAtOffset(filePath: string, offset: number, model
     await fileHandle.close();
   }
 
-  // Find the end of the line; fall back to bytesRead for last line without trailing newline.
-  const newlineIndex = buffer.indexOf("\n", 0);
+  // Find the end of the line within only the bytes that were actually read.
+  // Searching the full uninitialized buffer would hit arbitrary bytes past bytesRead.
+  const newlineIndex = buffer.subarray(0, bytesRead).indexOf("\n");
   const lineLength = newlineIndex === -1 ? bytesRead : newlineIndex;
   const line = buffer.subarray(0, lineLength).toString("utf8");
 
@@ -305,11 +306,21 @@ const buildPassthroughFilter = (): FilterFn => (): boolean => true;
  * Uses node:readline for streaming — never reads the entire file into memory.
  * Resolves with empty result if the file does not exist.
  * Skips deleted records. Applies filter, skip, and take with early exit.
+ *
+ * When `options.pkField` and `options.isLive` are provided, the scan tracks
+ * each line's byte offset and skips lines that are not the canonical (latest)
+ * version of the record. This handles both deletions and superseded update lines
+ * in the append-only log without a second pass.
  */
 async function scanRecords(filePath: string, options: ScanOptions): Promise<ScanResult> {
   try {
     await fs.access(filePath);
   } catch {
+    return { records: [], scannedCount: 0, matchedCount: 0 };
+  }
+
+  // take: 0 means collect nothing — no scan needed
+  if (options.take === 0) {
     return { records: [], scannedCount: 0, matchedCount: 0 };
   }
 
@@ -319,6 +330,10 @@ async function scanRecords(filePath: string, options: ScanOptions): Promise<Scan
     const results: RawRecord[] = [];
     const skip = options.skip ?? 0;
     let skippedSoFar = 0;
+    // Tracks the byte offset of the current line's start for isLive dedup.
+    let currentByteOffset = 0;
+    // Guards against processing buffered lines after early exit (rl.close() is async).
+    let done = false;
 
     const fileStream = createReadStream(filePath, { encoding: "utf8" });
     const rl = createInterface({ input: fileStream, crlfDelay: Infinity });
@@ -345,6 +360,14 @@ async function scanRecords(filePath: string, options: ScanOptions): Promise<Scan
     });
 
     rl.on("line", (line: string) => {
+      // Record the start offset of this line before advancing.
+      const lineStartOffset = currentByteOffset;
+      // +1 for the \n newline character (NDJSON always uses \n, not \r\n)
+      currentByteOffset += Buffer.byteLength(line, "utf8") + 1;
+
+      // Skip buffered lines that arrived after early exit was signalled.
+      if (done) return;
+
       let parsed: unknown;
       try {
         parsed = JSON.parse(line);
@@ -362,6 +385,14 @@ async function scanRecords(filePath: string, options: ScanOptions): Promise<Scan
 
       if (record["_deleted"] === true) return;
 
+      // Deduplication: skip superseded versions of the same record.
+      // When `isLive` is provided, only the line whose byte offset matches the
+      // physical index entry for this record's ID is canonical.
+      if (options.isLive !== undefined && options.pkField !== undefined) {
+        const id = record[options.pkField];
+        if (!options.isLive(id, lineStartOffset)) return;
+      }
+
       scannedCount++;
 
       if (options.filter !== undefined && !options.filter(record)) return;
@@ -376,6 +407,7 @@ async function scanRecords(filePath: string, options: ScanOptions): Promise<Scan
       results.push(record);
 
       if (options.take !== undefined && results.length >= options.take) {
+        done = true;
         rl.close();
       }
     });
@@ -394,11 +426,18 @@ export async function findMany(
 ): Promise<RawRecord[]> {
   try {
     const filter = compiledFilter ?? buildPassthroughFilter();
+    // Supply pkField and isLive so the scan engine can skip superseded update lines
+    // and lines for deleted records without re-reading the physical index on each line.
+    const pkField = ctx.schema.primaryKeyField;
+    const isLive = (id: unknown, offset: number): boolean =>
+      ctx.indexManager.getOffset(id as string | number) === offset;
     const scanResult = await scanRecords(ctx.paths.dataFile, {
       filter,
       take: args.take,
       skip: args.skip,
       orderBy: args.orderBy,
+      pkField,
+      isLive,
     });
     return scanResult.records.map((r) => applySelect(stripSystemFields(r), args.select));
   } catch (err: unknown) {

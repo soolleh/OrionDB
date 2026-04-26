@@ -24,6 +24,9 @@ import type {
   CreateArgs,
   CreateManyArgs,
   CreateManyResult,
+  UpdateArgs,
+  UpdateManyArgs,
+  UpdateManyResult,
   DeleteArgs,
   DeleteManyArgs,
   DeleteManyResult,
@@ -506,9 +509,305 @@ export async function createMany(
 }
 
 // ---------------------------------------------------------------------------
+// update()
+// ---------------------------------------------------------------------------
+
+/**
+ * Updates a single record matching `args.where` with the data in `args.data`.
+ * Appends a new record version to data.ndjson. Preserves `_createdAt`.
+ * The superseded original line is counted as a tombstone for compaction purposes.
+ *
+ * Relation fields and system fields in `args.data` are silently ignored.
+ * The primary key field may not be changed — throws `ValidationError` on mutation attempt.
+ *
+ * @throws RecordNotFoundError   if no matching record exists
+ * @throws ValidationError       if data contains an invalid type or PK mutation attempt
+ * @throws UniqueConstraintError if update introduces a unique constraint violation
+ * @throws CompactionError       on unexpected I/O error
+ */
+export async function update(ctx: ModelWriterContext, args: UpdateArgs): Promise<Record<string, unknown>> {
+  try {
+    const readerCtx: ModelReaderContext = {
+      modelName: ctx.modelName,
+      paths: ctx.paths,
+      schema: ctx.schema,
+      indexManager: ctx.indexManager,
+    };
+
+    // Step 1 — Find existing record (stripped, no system fields)
+    const existing = await findUnique(readerCtx, { where: args.where });
+    if (existing === null) {
+      throw new RecordNotFoundError(`No record found for the given where clause on model '${ctx.modelName}'.`, {
+        model: ctx.modelName,
+        meta: { where: args.where },
+      });
+    }
+
+    // Step 2 — PK mutation guard
+    const pkField = ctx.schema.primaryKeyField;
+    const existingPk = existing[pkField];
+    const attemptedPk = args.data[pkField];
+    if (attemptedPk !== undefined && attemptedPk !== existingPk) {
+      throw new ValidationError(`Cannot change primary key field '${pkField}' on model '${ctx.modelName}'.`, {
+        model: ctx.modelName,
+        field: pkField,
+        meta: { existingPk, attemptedPk },
+      });
+    }
+
+    if (!isPrimaryKeyValue(existingPk)) {
+      throw new ValidationError(`Primary key field '${pkField}' has an invalid type on model '${ctx.modelName}'.`, {
+        model: ctx.modelName,
+        field: pkField,
+        meta: { value: existingPk },
+      });
+    }
+    const pkValue = existingPk;
+
+    // Step 3 — Read raw record from disk at its known offset
+    const offset = ctx.indexManager.getOffset(pkValue);
+    if (offset === undefined) {
+      throw new RecordNotFoundError(
+        `Record with ${pkField} '${String(pkValue)}' is not in the physical index on model '${ctx.modelName}'.`,
+        { model: ctx.modelName, meta: { pkValue } },
+      );
+    }
+    const rawRecord = await readRecordAtOffset(ctx.paths.dataFile, offset, ctx.modelName);
+
+    // Step 4 — Build merged data (skip system fields and relation fields from args.data)
+    const userDataFiltered: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(args.data)) {
+      if (SYSTEM_FIELDS.includes(key)) continue;
+      const fieldDef = ctx.schema.fields.get(key);
+      if (fieldDef?.type === "relation") continue;
+      userDataFiltered[key] = value;
+    }
+    const mergedData = { ...stripSystemFields(rawRecord), ...userDataFiltered };
+
+    // Step 5 — Validate merged record
+    validateFieldTypes(mergedData, ctx.schema, ctx.modelName);
+    checkUniqueConstraints(mergedData, ctx.schema, ctx.indexManager, ctx.modelName, pkValue);
+
+    // Step 6 — Re-attach system fields, preserving _createdAt from original
+    const rawCreatedAt = rawRecord["_createdAt"];
+    const recordToWrite = attachSystemFields(mergedData, {
+      _createdAt: typeof rawCreatedAt === "string" ? rawCreatedAt : new Date().toISOString(),
+    });
+
+    // Step 7 — Serialize
+    const serializedLine = serializeRecord(recordToWrite);
+
+    // Step 8 — Get current offset from in-memory counter (never fs.stat)
+    const currentOffset = ctx.counter.getSize();
+
+    // Step 9 — Append new record version
+    await fs.appendFile(ctx.paths.dataFile, serializedLine);
+
+    // Step 10 — Update all three index structures atomically
+    ctx.indexManager.update(rawRecord, recordToWrite, currentOffset);
+
+    // Step 11 — Increment counter
+    ctx.counter.increment(Buffer.byteLength(serializedLine, "utf8"));
+
+    // Step 12 — Update meta: old line becomes superseded (tombstone)
+    const existingMeta = await readModelMeta(ctx.paths);
+    await updateModelMeta(ctx.paths, {
+      tombstoneCount: existingMeta.tombstoneCount + 1,
+    });
+
+    // Auto-compact threshold check (compaction triggered in prompt 5.8)
+    const updatedMeta = await readModelMeta(ctx.paths);
+    if (shouldAutoCompact(updatedMeta, ctx.autoCompactThreshold ?? 0.3)) {
+      // compaction will be triggered here in prompt 5.8
+    }
+
+    // Step 13 — Return the updated record with system fields stripped
+    return stripSystemFields(recordToWrite);
+  } catch (err: unknown) {
+    if (err instanceof OrionDBError) throw err;
+    throw new CompactionError(`Unexpected error during update() on model '${ctx.modelName}'.`, {
+      model: ctx.modelName,
+      meta: { cause: err },
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// updateMany()
+// ---------------------------------------------------------------------------
+
+/**
+ * Updates all records matching `args.where` with the data in `args.data`.
+ * Validates ALL records before writing ANY (batch atomicity).
+ * Meta is updated exactly once after all writes.
+ * Returns `{ count: N }` where N is the number of records updated.
+ *
+ * @throws ValidationError       if any record in the batch fails type validation
+ * @throws UniqueConstraintError if any record introduces a unique constraint collision
+ * @throws CompactionError       on mid-batch write failure (includes writtenCount in meta)
+ */
+export async function updateMany(
+  ctx: ModelWriterContext,
+  args: UpdateManyArgs,
+  compiledFilter?: FilterFn,
+): Promise<UpdateManyResult> {
+  try {
+    const readerCtx: ModelReaderContext = {
+      modelName: ctx.modelName,
+      paths: ctx.paths,
+      schema: ctx.schema,
+      indexManager: ctx.indexManager,
+    };
+
+    // Step 1 — Find all matching records
+    const matching = await findMany(readerCtx, { where: args.where }, compiledFilter);
+    if (matching.length === 0) {
+      return { count: 0 };
+    }
+
+    const pkField = ctx.schema.primaryKeyField;
+
+    // Step 2 — Validation pass: buildmerged records, validate, prepare write entries
+    type ToUpdateEntry = {
+      rawRecord: Record<string, unknown>;
+      recordToWrite: Record<string, unknown>;
+      pkValue: PrimaryKey;
+    };
+    const toUpdate: ToUpdateEntry[] = [];
+
+    for (let i = 0; i < matching.length; i++) {
+      const existing = matching[i];
+      if (existing === undefined) continue;
+
+      // PK mutation guard
+      const existingPk = existing[pkField];
+      const attemptedPk = args.data[pkField];
+      if (attemptedPk !== undefined && attemptedPk !== existingPk) {
+        throw new ValidationError(`Cannot change primary key field '${pkField}' on model '${ctx.modelName}'.`, {
+          model: ctx.modelName,
+          field: pkField,
+          meta: { existingPk, attemptedPk, batchIndex: i },
+        });
+      }
+
+      if (!isPrimaryKeyValue(existingPk)) continue;
+      const pkValue = existingPk;
+
+      const offset = ctx.indexManager.getOffset(pkValue);
+      if (offset === undefined) continue; // deleted between scan and update — skip
+
+      const rawRecord = await readRecordAtOffset(ctx.paths.dataFile, offset, ctx.modelName);
+
+      // Merge
+      const userDataFiltered: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(args.data)) {
+        if (SYSTEM_FIELDS.includes(key)) continue;
+        const fieldDef = ctx.schema.fields.get(key);
+        if (fieldDef?.type === "relation") continue;
+        userDataFiltered[key] = value;
+      }
+      const mergedData = { ...stripSystemFields(rawRecord), ...userDataFiltered };
+
+      // Validate merged
+      try {
+        validateFieldTypes(mergedData, ctx.schema, ctx.modelName);
+      } catch (e: unknown) {
+        if (e instanceof ValidationError) {
+          throw new ValidationError(e.message, {
+            model: ctx.modelName,
+            field: e.field,
+            meta: { batchIndex: i, originalError: e.message },
+          });
+        }
+        throw e;
+      }
+
+      try {
+        checkUniqueConstraints(mergedData, ctx.schema, ctx.indexManager, ctx.modelName, pkValue);
+      } catch (e: unknown) {
+        if (e instanceof UniqueConstraintError) {
+          throw new UniqueConstraintError(e.message, {
+            model: ctx.modelName,
+            field: e.field,
+            meta: { batchIndex: i, originalError: e.message },
+          });
+        }
+        throw e;
+      }
+
+      const rawCreatedAt = rawRecord["_createdAt"];
+      const recordToWrite = attachSystemFields(mergedData, {
+        _createdAt: typeof rawCreatedAt === "string" ? rawCreatedAt : new Date().toISOString(),
+      });
+
+      toUpdate.push({ rawRecord, recordToWrite, pkValue });
+    }
+
+    // Check for within-batch unique field conflicts introduced by the updates
+    checkBatchUniqueness(
+      toUpdate.map((e) => stripSystemFields(e.recordToWrite)),
+      ctx.schema,
+      ctx.modelName,
+    );
+
+    if (toUpdate.length === 0) {
+      return { count: 0 };
+    }
+
+    // Step 3 — Write pass: append new version of each record sequentially
+    let writtenCount = 0;
+    for (const { rawRecord, recordToWrite } of toUpdate) {
+      const serializedLine = serializeRecord(recordToWrite);
+      const currentOffset = ctx.counter.getSize();
+
+      try {
+        await fs.appendFile(ctx.paths.dataFile, serializedLine);
+      } catch (err: unknown) {
+        throw new CompactionError(
+          `Write failed mid-batch during updateMany() on model '${ctx.modelName}' (record ${writtenCount}).`,
+          {
+            model: ctx.modelName,
+            meta: { cause: err, writtenCount, totalCount: toUpdate.length },
+          },
+        );
+      }
+
+      ctx.indexManager.update(rawRecord, recordToWrite, currentOffset);
+      ctx.counter.increment(Buffer.byteLength(serializedLine, "utf8"));
+      writtenCount++;
+    }
+
+    // Step 4 — Update meta once after all writes
+    const existingMeta = await readModelMeta(ctx.paths);
+    await updateModelMeta(ctx.paths, {
+      tombstoneCount: existingMeta.tombstoneCount + toUpdate.length,
+    });
+
+    // Auto-compact threshold check (compaction triggered in prompt 5.8)
+    const updatedMeta = await readModelMeta(ctx.paths);
+    if (shouldAutoCompact(updatedMeta, ctx.autoCompactThreshold ?? 0.3)) {
+      // compaction will be triggered here in prompt 5.8
+    }
+
+    return { count: toUpdate.length };
+  } catch (err: unknown) {
+    if (err instanceof OrionDBError) throw err;
+    throw new CompactionError(`Unexpected error during updateMany() on model '${ctx.modelName}'.`, {
+      model: ctx.modelName,
+      meta: { cause: err },
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Private type guards
 // ---------------------------------------------------------------------------
 
+function isPrimaryKeyValue(value: unknown): value is PrimaryKey {
+  return typeof value === "string" || typeof value === "number";
+}
+
+/** @alias isPrimaryKeyValue for backward compatibility within this file */
 function isPrimaryKey(value: unknown): value is PrimaryKey {
   return typeof value === "string" || typeof value === "number";
 }
