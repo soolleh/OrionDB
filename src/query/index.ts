@@ -27,5 +27,5 @@ export type {
 export { LOGICAL_OPERATORS, SCALAR_OPERATORS, isLogicalOperator, isScalarOperator } from "./types.js";
 
 export { compileFilter } from "./filter.js";
-export { compileSort } from "./sort.js";
-export { applyPagination } from "./pagination.js";
+export { compileSort, applySort } from "./sort.js";
+export { applyPagination, buildPaginationStrategy, getPageInfo } from "./pagination.js";
