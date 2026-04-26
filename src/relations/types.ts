@@ -181,6 +181,35 @@ export interface NestedCreateInput {
 }
 
 // ---------------------------------------------------------------------------
+// NestedConnectInput
+// ---------------------------------------------------------------------------
+
+/**
+ * Input shape for a nested connect operation. Links an existing
+ * related record by updating its foreign key.
+ *
+ * @example
+ * ```ts
+ * db.post.create({
+ *   data: {
+ *     title: 'Hello',
+ *     author: { connect: { id: 'user-123' } },
+ *   },
+ * })
+ * ```
+ */
+export interface NestedConnectInput {
+  connect: Record<string, unknown> | Record<string, unknown>[];
+}
+
+/**
+ * Union of all supported nested operation input shapes.
+ * A relation field may contain both `create` and `connect`
+ * simultaneously.
+ */
+export type NestedOperationValue = NestedCreateInput | NestedConnectInput | (NestedCreateInput & NestedConnectInput);
+
+// ---------------------------------------------------------------------------
 // NestedWriteOperation
 // ---------------------------------------------------------------------------
 
@@ -231,6 +260,20 @@ export const isIncludeAll = (value: IncludeValue): value is IncludeAll => value 
  */
 export const isIncludeObject = (value: IncludeValue): value is Exclude<IncludeValue, true> =>
   typeof value === "object" && value !== null;
+
+/**
+ * Returns `true` when the value is a nested create input shape
+ * (has a `create` key).
+ */
+export const isNestedCreate = (value: unknown): value is NestedCreateInput =>
+  typeof value === "object" && value !== null && "create" in value;
+
+/**
+ * Returns `true` when the value is a nested connect input shape
+ * (has a `connect` key).
+ */
+export const isNestedConnect = (value: unknown): value is NestedConnectInput =>
+  typeof value === "object" && value !== null && "connect" in value;
 
 // ---------------------------------------------------------------------------
 // buildRelationDescriptor
