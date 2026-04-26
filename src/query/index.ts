@@ -29,3 +29,4 @@ export { LOGICAL_OPERATORS, SCALAR_OPERATORS, isLogicalOperator, isScalarOperato
 export { compileFilter } from "./filter.js";
 export { compileSort, applySort } from "./sort.js";
 export { applyPagination, buildPaginationStrategy, getPageInfo } from "./pagination.js";
+export { count, aggregate, groupBy } from "./aggregations.js";
