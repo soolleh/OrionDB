@@ -10,6 +10,22 @@ export type {
   ModelWriterContext,
   CreateManyArgs,
   CreateManyResult,
+  RawRecord,
+  SelectClause,
+  FindUniqueArgs,
+  FindUniqueOrThrowArgs,
+  ModelReaderContext,
+  WhereClause,
+  FilterFn,
+  OrderByDirection,
+  OrderByClause,
+  ScanOptions,
+  ScanResult,
+  FindManyArgs,
+  FindFirstArgs,
+  DeleteArgs,
+  DeleteManyArgs,
+  DeleteManyResult,
 } from "./types.js";
 
 export {
@@ -20,6 +36,7 @@ export {
   ORIONDB_VERSION,
   DATABASE_META_VERSION,
   NEWLINE,
+  READ_BUFFER_SIZE,
 } from "./types.js";
 
 export {
@@ -33,4 +50,6 @@ export {
 
 export { FileSizeCounter, FileSizeCounterManager } from "./file-size-counter.js";
 
-export { create, createMany } from "./writer.js";
+export { create, createMany, stripSystemFields, deleteRecord, deleteMany } from "./writer.js";
+
+export { findUnique, findUniqueOrThrow, findMany, findFirst } from "./reader.js";

@@ -27,6 +27,12 @@ export const ORIONDB_VERSION = "0.2.0" as const;
 export const DATABASE_META_VERSION = 1 as const;
 export const NEWLINE = "\n" as const;
 
+/**
+ * Maximum byte length of a single NDJSON line read in one `fs.read()` call.
+ * 64 KiB is sufficient for any reasonable record in Phase 1.
+ */
+export const READ_BUFFER_SIZE = 65_536 as const;
+
 // ---------------------------------------------------------------------------
 // Interfaces
 // ---------------------------------------------------------------------------
@@ -104,6 +110,8 @@ export interface ModelWriterContext {
   schema: ParsedModelDefinition;
   indexManager: IndexManager<Record<string, unknown>>;
   counter: FileSizeCounter;
+  /** Fraction (0–1) at which auto-compaction is triggered. Defaults to 0.30. */
+  autoCompactThreshold?: number;
 }
 
 /**
@@ -117,5 +125,146 @@ export interface CreateManyArgs<TData extends Record<string, unknown>> {
  * Result returned from a createMany() operation.
  */
 export interface CreateManyResult {
+  count: number;
+}
+
+// ---------------------------------------------------------------------------
+// Reader types
+// ---------------------------------------------------------------------------
+
+/**
+ * Untyped record shape as read from disk, before system field stripping.
+ */
+export type RawRecord = Record<string, unknown>;
+
+/**
+ * A map of field names to inclusion flags for narrowing the returned record shape.
+ * Only fields set to `true` are included in the result.
+ */
+export type SelectClause = Record<string, boolean>;
+
+/**
+ * Arguments for findUnique().
+ */
+export interface FindUniqueArgs {
+  where: Record<string, unknown>;
+  select?: SelectClause;
+}
+
+/**
+ * Arguments for findUniqueOrThrow().
+ */
+export interface FindUniqueOrThrowArgs {
+  where: Record<string, unknown>;
+  select?: SelectClause;
+}
+
+/**
+ * Groups all dependencies required by a reader operation for a single model.
+ * Does not include FileSizeCounter — readers never write and never call fs.stat.
+ */
+export interface ModelReaderContext {
+  modelName: string;
+  paths: ModelPaths;
+  schema: ParsedModelDefinition;
+  indexManager: IndexManager<Record<string, unknown>>;
+}
+
+// ---------------------------------------------------------------------------
+// Full scan types
+// ---------------------------------------------------------------------------
+
+/**
+ * A raw where clause as passed by the caller.
+ * Operator evaluation is delegated to the query engine via FilterFn.
+ */
+export type WhereClause = Record<string, unknown>;
+
+/**
+ * A compiled predicate for the scan engine.
+ * Returns `true` if the record should be included in results.
+ */
+export type FilterFn = (record: RawRecord) => boolean;
+
+/**
+ * Sort direction for a single field.
+ */
+export type OrderByDirection = "asc" | "desc";
+
+/**
+ * A map of field names to sort direction.
+ * Applied after the scan completes — not inside the scan engine.
+ */
+export type OrderByClause = {
+  [field: string]: OrderByDirection;
+};
+
+/**
+ * Options controlling a full scan pass over data.ndjson.
+ */
+export interface ScanOptions {
+  /** Pre-compiled predicate — `undefined` means match all records. */
+  filter?: FilterFn;
+  /** Maximum number of records to collect. `undefined` means no limit. */
+  take?: number;
+  /** Number of matched records to skip before collecting. `undefined` means 0. */
+  skip?: number;
+  /** Sort clause — stored in result but not applied by the scan engine. */
+  orderBy?: OrderByClause;
+}
+
+/**
+ * Result returned from `scanRecords`.
+ */
+export interface ScanResult {
+  records: RawRecord[];
+  /** Total non-deleted lines scanned (for diagnostics). */
+  scannedCount: number;
+  /** Records matched by filter before skip/take. */
+  matchedCount: number;
+}
+
+/**
+ * Arguments for findMany().
+ */
+export interface FindManyArgs {
+  where?: WhereClause;
+  select?: SelectClause;
+  take?: number;
+  skip?: number;
+  orderBy?: OrderByClause;
+}
+
+/**
+ * Arguments for findFirst().
+ */
+export interface FindFirstArgs {
+  where?: WhereClause;
+  select?: SelectClause;
+  orderBy?: OrderByClause;
+}
+
+// ---------------------------------------------------------------------------
+// Delete types
+// ---------------------------------------------------------------------------
+
+/**
+ * Arguments for deleteRecord().
+ */
+export interface DeleteArgs {
+  where: Record<string, unknown>;
+}
+
+/**
+ * Arguments for deleteMany().
+ */
+export interface DeleteManyArgs {
+  where?: WhereClause;
+}
+
+/**
+ * Result returned from a deleteMany() operation.
+ */
+export interface DeleteManyResult {
   count: number;
 }

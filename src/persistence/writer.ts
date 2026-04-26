@@ -1,21 +1,33 @@
 // src/persistence/writer.ts
-// Implements the write path: create, createMany, update, updateMany
-// createMany, update, updateMany are implemented in prompt 4.4
+// Implements the write path: create, createMany, update, updateMany,
+// deleteRecord, deleteMany
 
 import * as fs from "node:fs/promises";
-import { CompactionError, OrionDBError, UniqueConstraintError, ValidationError } from "../errors/index.js";
+import {
+  CompactionError,
+  OrionDBError,
+  RecordNotFoundError,
+  UniqueConstraintError,
+  ValidationError,
+} from "../errors/index.js";
 import type { IndexManager, PrimaryKey } from "../index-manager/index.js";
 import { SYSTEM_FIELDS } from "../schema/index.js";
 import type { ParsedModelDefinition } from "../schema/index.js";
 import { updateModelMeta } from "./initializer.js";
+import { findMany, findUnique, readRecordAtOffset } from "./reader.js";
 import { NEWLINE } from "./types.js";
 import type {
   ModelMeta,
   ModelPaths,
+  ModelReaderContext,
   ModelWriterContext,
   CreateArgs,
   CreateManyArgs,
   CreateManyResult,
+  DeleteArgs,
+  DeleteManyArgs,
+  DeleteManyResult,
+  FilterFn,
 } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -181,8 +193,9 @@ function attachSystemFields(data: Record<string, unknown>, existing?: { _created
 /**
  * Returns a shallow copy of `record` with all three system fields removed.
  * Does not mutate the input.
+ * Exported for use by reader.ts — single implementation shared across the module.
  */
-function stripSystemFields(record: Record<string, unknown>): Record<string, unknown> {
+export function stripSystemFields(record: Record<string, unknown>): Record<string, unknown> {
   const result: Record<string, unknown> = { ...record };
   for (const field of SYSTEM_FIELDS) {
     delete result[field];
@@ -498,4 +511,237 @@ export async function createMany(
 
 function isPrimaryKey(value: unknown): value is PrimaryKey {
   return typeof value === "string" || typeof value === "number";
+}
+
+// ---------------------------------------------------------------------------
+// buildTombstone (private)
+// ---------------------------------------------------------------------------
+
+/**
+ * Constructs a tombstone from an existing raw record (system fields present).
+ * Sets `_deleted` to `true`, updates `_updatedAt`, preserves `_createdAt`.
+ * System fields appear last, consistent with `attachSystemFields` convention.
+ * Returns a new object — never mutates the input.
+ */
+const buildTombstone = (rawRecord: Record<string, unknown>): Record<string, unknown> => {
+  // Destructure to separate user fields from system fields so we can
+  // rewrite system fields at the end of the object.
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { _deleted: _prevDeleted, _createdAt, _updatedAt: _prevUpdatedAt, ...userFields } = rawRecord;
+  return {
+    ...userFields,
+    _deleted: true,
+    _createdAt,
+    _updatedAt: new Date().toISOString(),
+  };
+};
+
+// ---------------------------------------------------------------------------
+// shouldAutoCompact (private)
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns `true` when the tombstone ratio meets or exceeds `threshold`.
+ * Returns `false` when `totalLines` is 0 to avoid division by zero.
+ * `threshold` is a fraction between 0 and 1 (e.g. 0.30 for 30%).
+ */
+const shouldAutoCompact = (meta: ModelMeta, threshold: number): boolean => {
+  if (meta.totalLines === 0) return false;
+  return meta.tombstoneCount / meta.totalLines >= threshold;
+};
+
+// ---------------------------------------------------------------------------
+// deleteRecord()
+// ---------------------------------------------------------------------------
+
+/**
+ * Deletes a single record matching `args.where`.
+ * Appends a tombstone line, removes the record from all indexes, updates meta.
+ * Returns the pre-deletion record state with system fields stripped.
+ *
+ * @throws RecordNotFoundError  if no matching record exists
+ * @throws QueryError           if the where clause does not reference PK or unique field
+ * @throws ValidationError      if the PK value has an unexpected type
+ * @throws CompactionError      if an unexpected I/O error occurs
+ */
+export async function deleteRecord(ctx: ModelWriterContext, args: DeleteArgs): Promise<Record<string, unknown>> {
+  try {
+    const readerCtx: ModelReaderContext = {
+      modelName: ctx.modelName,
+      paths: ctx.paths,
+      schema: ctx.schema,
+      indexManager: ctx.indexManager,
+    };
+
+    // Step 1 — Find existing record (returns stripped record or null)
+    const existing = await findUnique(readerCtx, { where: args.where });
+    if (existing === null) {
+      throw new RecordNotFoundError(`No record found for the given where clause on model '${ctx.modelName}'.`, {
+        model: ctx.modelName,
+        meta: { where: args.where },
+      });
+    }
+
+    // Step 2 — Resolve PK and read raw record from disk
+    const pkValue = existing[ctx.schema.primaryKeyField];
+    if (!isPrimaryKey(pkValue)) {
+      throw new ValidationError(
+        `Primary key field '${ctx.schema.primaryKeyField}' has an invalid type on model '${ctx.modelName}'.`,
+        { model: ctx.modelName, field: ctx.schema.primaryKeyField, meta: { value: pkValue } },
+      );
+    }
+
+    const offset = ctx.indexManager.getOffset(pkValue);
+    if (offset === undefined) {
+      // Defensive: should not occur if findUnique succeeded
+      throw new RecordNotFoundError(
+        `Record with ${ctx.schema.primaryKeyField} '${String(pkValue)}' is not in the physical index on model '${ctx.modelName}'.`,
+        { model: ctx.modelName, meta: { pkValue } },
+      );
+    }
+
+    const rawRecord = await readRecordAtOffset(ctx.paths.dataFile, offset, ctx.modelName);
+
+    // Step 3 — Build tombstone
+    const tombstone = buildTombstone(rawRecord);
+
+    // Step 4 — Serialize
+    const serializedLine = serializeRecord(tombstone);
+
+    // Step 5-6 — Append tombstone (tombstone is written at ctx.counter.getSize())
+    await fs.appendFile(ctx.paths.dataFile, serializedLine);
+
+    // Step 7 — Remove from all index structures (logical → reverse map → physical)
+    ctx.indexManager.delete(pkValue);
+
+    // Step 8 — Increment file size counter
+    ctx.counter.increment(Buffer.byteLength(serializedLine, "utf8"));
+
+    // Step 9 — Update meta.json
+    const existingMeta = await readModelMeta(ctx.paths);
+    await updateModelMeta(ctx.paths, {
+      recordCount: existingMeta.recordCount - 1,
+      tombstoneCount: existingMeta.tombstoneCount + 1,
+    });
+
+    // Auto-compact threshold check (compaction triggered in prompt 5.8)
+    const updatedMeta = await readModelMeta(ctx.paths);
+    if (shouldAutoCompact(updatedMeta, ctx.autoCompactThreshold ?? 0.3)) {
+      // compaction will be triggered here in prompt 5.8
+    }
+
+    // Step 10 — Return pre-deletion record without system fields
+    return stripSystemFields(rawRecord);
+  } catch (err: unknown) {
+    if (err instanceof OrionDBError) throw err;
+    throw new CompactionError(`Unexpected error during deleteRecord() on model '${ctx.modelName}'.`, {
+      model: ctx.modelName,
+      meta: { cause: err },
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// deleteMany()
+// ---------------------------------------------------------------------------
+
+/**
+ * Deletes all records matching the optional `args.where` clause.
+ * Pass `compiledFilter` from the query engine for operator-based filtering.
+ * Tombstones are written sequentially. Meta is updated once after all writes.
+ * Returns `{ count: N }` where N is the number of records deleted.
+ *
+ * @throws CompactionError  on mid-batch write failure (includes `deletedCount` in meta)
+ */
+export async function deleteMany(
+  ctx: ModelWriterContext,
+  args: DeleteManyArgs,
+  compiledFilter?: FilterFn,
+): Promise<DeleteManyResult> {
+  try {
+    const readerCtx: ModelReaderContext = {
+      modelName: ctx.modelName,
+      paths: ctx.paths,
+      schema: ctx.schema,
+      indexManager: ctx.indexManager,
+    };
+
+    // Step 1 — Find all matching records (returns stripped records)
+    const matching = await findMany(readerCtx, { where: args.where }, compiledFilter);
+    if (matching.length === 0) {
+      return { count: 0 };
+    }
+
+    // Step 2 — Collect raw records and resolved PKs
+    type ToDeleteEntry = { rawRecord: Record<string, unknown>; pkValue: PrimaryKey };
+    const toDelete: ToDeleteEntry[] = [];
+
+    for (const record of matching) {
+      const pkValue = record[ctx.schema.primaryKeyField];
+      if (!isPrimaryKey(pkValue)) continue; // defensive — skip records with invalid PK type
+
+      const offset = ctx.indexManager.getOffset(pkValue);
+      if (offset === undefined) continue; // already deleted between scan and delete — skip
+
+      const rawRecord = await readRecordAtOffset(ctx.paths.dataFile, offset, ctx.modelName);
+      toDelete.push({ rawRecord, pkValue });
+    }
+
+    if (toDelete.length === 0) {
+      return { count: 0 };
+    }
+
+    // Step 3 — Write pass: one tombstone per record, sequentially
+    let writtenCount = 0;
+    for (const { rawRecord, pkValue } of toDelete) {
+      // a. Build tombstone
+      const tombstone = buildTombstone(rawRecord);
+
+      // b. Serialize
+      const serializedLine = serializeRecord(tombstone);
+
+      // c-d. Append tombstone
+      try {
+        await fs.appendFile(ctx.paths.dataFile, serializedLine);
+      } catch (err: unknown) {
+        throw new CompactionError(
+          `Write failed mid-batch during deleteMany() on model '${ctx.modelName}' (tombstone ${writtenCount}).`,
+          {
+            model: ctx.modelName,
+            meta: { cause: err, deletedCount: writtenCount, totalCount: toDelete.length },
+          },
+        );
+      }
+
+      // e. Remove from all index structures
+      ctx.indexManager.delete(pkValue);
+
+      // f. Increment file size counter
+      ctx.counter.increment(Buffer.byteLength(serializedLine, "utf8"));
+
+      writtenCount++;
+    }
+
+    // Step 4 — Update meta.json once after all writes
+    const existingMeta = await readModelMeta(ctx.paths);
+    await updateModelMeta(ctx.paths, {
+      recordCount: existingMeta.recordCount - toDelete.length,
+      tombstoneCount: existingMeta.tombstoneCount + toDelete.length,
+    });
+
+    // Auto-compact threshold check (compaction triggered in prompt 5.8)
+    const updatedMeta = await readModelMeta(ctx.paths);
+    if (shouldAutoCompact(updatedMeta, ctx.autoCompactThreshold ?? 0.3)) {
+      // compaction will be triggered here in prompt 5.8
+    }
+
+    // Step 5 — Return result
+    return { count: toDelete.length };
+  } catch (err: unknown) {
+    if (err instanceof OrionDBError) throw err;
+    throw new CompactionError(`Unexpected error during deleteMany() on model '${ctx.modelName}'.`, {
+      model: ctx.modelName,
+      meta: { cause: err },
+    });
+  }
 }
