@@ -118,7 +118,7 @@ export async function initializeModelDirectory(paths: ModelPaths, modelName: str
   // If meta.json exists, read and return it
   const metaExists = await fileExists(paths.metaFile);
   if (metaExists) {
-    return readModelMeta(paths.metaFile);
+    return readModelMeta(paths);
   }
 
   // Create a fresh meta.json
@@ -179,7 +179,7 @@ export async function updateModelMeta(
   paths: ModelPaths,
   updates: Partial<Omit<ModelMeta, "modelName" | "createdAt">>,
 ): Promise<ModelMeta> {
-  const current = await readModelMeta(paths.metaFile);
+  const current = await readModelMeta(paths);
 
   const merged: ModelMeta = {
     ...current,
@@ -217,10 +217,11 @@ async function fileExists(filePath: string): Promise<boolean> {
 }
 
 /**
- * Reads and parses a ModelMeta JSON file.
+ * Reads and parses a ModelMeta JSON file from `paths.metaFile`.
  * Throws CompactionError if the file cannot be read or is not a plain object.
  */
-async function readModelMeta(metaFilePath: string): Promise<ModelMeta> {
+export async function readModelMeta(paths: ModelPaths): Promise<ModelMeta> {
+  const metaFilePath = paths.metaFile;
   let raw: string;
   try {
     raw = await fs.readFile(metaFilePath, "utf8");
@@ -244,4 +245,31 @@ async function readModelMeta(metaFilePath: string): Promise<ModelMeta> {
   }
 
   return parsed as ModelMeta;
+}
+
+// ---------------------------------------------------------------------------
+// shouldAutoCompact
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns `true` when the dead-line ratio for `modelName` equals or exceeds
+ * `threshold`. Returns `false` when the file is empty, below threshold, or
+ * when the meta file cannot be read (fail-safe — never triggers on error).
+ *
+ * @param paths - Resolved model paths (only `metaFile` is read).
+ * @param threshold - Fraction (0–1) at which compaction should trigger.
+ *   Defaults to 0.30 when `undefined`.
+ */
+export async function shouldAutoCompact(paths: ModelPaths, threshold: number | undefined): Promise<boolean> {
+  const effectiveThreshold = threshold ?? 0.3;
+  if (effectiveThreshold <= 0) return false;
+  try {
+    const meta = await readModelMeta(paths);
+    if (meta.totalLines === 0) return false;
+    const deadLines = meta.totalLines - meta.recordCount;
+    const ratio = deadLines / meta.totalLines;
+    return ratio >= effectiveThreshold;
+  } catch {
+    return false;
+  }
 }

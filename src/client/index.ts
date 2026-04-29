@@ -1,7 +1,6 @@
 // src/client/index.ts — barrel re-exports only
 
 export type {
-  SchemaDefinition,
   OrionDBConfig,
   ModelClientConfig,
   CreateInput,
@@ -29,6 +28,8 @@ export type {
   DisconnectOptions,
   LifecycleHooks,
   OperationTrackerInterface,
+  CompactionResult,
+  CompactOptions,
 } from "./types.js";
 
 export { createModelClient, assertConnected } from "./model-client.js";

@@ -49,6 +49,8 @@ export {
   initializeModelDirectory,
   initializeAllModelDirectories,
   updateModelMeta,
+  readModelMeta,
+  shouldAutoCompact,
 } from "./initializer.js";
 
 export { FileSizeCounter, FileSizeCounterManager } from "./file-size-counter.js";

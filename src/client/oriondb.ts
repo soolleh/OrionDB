@@ -4,18 +4,20 @@
 // Returns a Proxy immediately (no I/O at construction).
 // All I/O happens inside $connect().
 
+import { readFile, writeFile, rename, unlink, stat } from "node:fs/promises";
 import {
   resolveDatabasePaths,
   resolveModelPaths,
   initializeDatabaseDirectory,
   initializeModelDirectory,
   updateModelMeta,
+  readModelMeta,
   FileSizeCounter,
 } from "../persistence/index.js";
 import { parseModelSchema, readSchemaFile, writeSchemaFile, runStartupSchemaValidation } from "../schema/index.js";
 import type { ParsedModelDefinition } from "../schema/index.js";
 import { IndexManagerImpl } from "../index-manager/index.js";
-import { OrionDBError, QueryError } from "../errors/index.js";
+import { OrionDBError, QueryError, CompactionError } from "../errors/index.js";
 import type {
   OrionDBConfig,
   OrionDB,
@@ -24,6 +26,8 @@ import type {
   DisconnectOptions,
   StartupResult,
   ModelClientMethods,
+  CompactOptions,
+  CompactionResult,
 } from "./types.js";
 import { createModelClient } from "./model-client.js";
 import { createLogger } from "./logger.js";
@@ -35,6 +39,24 @@ import { createLogger } from "./logger.js";
 const DEFAULT_MISMATCH_STRATEGY = "block" as const;
 const DEFAULT_LOG_LEVEL = "warn" as const;
 const DEFAULT_DISCONNECT_TIMEOUT_MS = 5_000 as const;
+
+// ---------------------------------------------------------------------------
+// computeCompactionRatio
+// ---------------------------------------------------------------------------
+
+/**
+ * Pure function — no I/O.
+ * Returns the fraction of dead lines (stale versions + tombstones) relative
+ * to total lines in the model's `data.ndjson`.
+ *
+ * `deadLines = totalLines − recordCount` (live records).
+ * Returns `0` for empty models.
+ */
+const computeCompactionRatio = (meta: { totalLines: number; recordCount: number }): number => {
+  if (meta.totalLines === 0) return 0;
+  const deadLines = meta.totalLines - meta.recordCount;
+  return deadLines / meta.totalLines;
+};
 
 // ---------------------------------------------------------------------------
 // OperationTracker
@@ -57,9 +79,14 @@ class OperationTracker {
    */
   track<T>(operation: Promise<T>): Promise<T> {
     this.pending.add(operation);
-    void operation.finally(() => {
-      this.pending.delete(operation);
-    });
+    // Use .then(onFulfilled, onRejected) with the same cleanup for both branches.
+    // Unlike .finally(), this creates a promise that always RESOLVES (both handlers
+    // return undefined), preventing an unhandled-rejection on the cleanup chain
+    // while still removing the operation from the pending set.
+    operation.then(
+      () => this.pending.delete(operation),
+      () => this.pending.delete(operation),
+    );
     return operation;
   }
 
@@ -123,6 +150,17 @@ async function initializeModel(
   ctx: ClientContext,
 ): Promise<StartupResult> {
   const paths = resolveModelPaths(ctx.config.dbLocation, modelName);
+
+  // Clean up any leftover compaction temp file from a previous crashed run.
+  // This is best-effort — a missing file is the normal case.
+  const tempFile = `${paths.dataFile}.compact.tmp`;
+  try {
+    await unlink(tempFile);
+    ctx.logger.warn(`Removed leftover compaction temp file for '${modelName}'`, { tempFile });
+  } catch {
+    // File does not exist — normal case, ignore
+  }
+
   const meta = await initializeModelDirectory(paths, modelName);
 
   const indexManager = new IndexManagerImpl<Record<string, unknown>>({
@@ -274,6 +312,21 @@ export const createOrionDB = (config: OrionDBConfig): OrionDB => {
           operationTracker,
           strict: ctx.config.strict,
           logger,
+          onShouldCompact: (name) => {
+            // Fire-and-forget auto-compact — never blocks the write return path
+            compactModel(name, ctx, { force: false })
+              .then((result) => {
+                if (result !== null) {
+                  ctx.logger.info("Auto-compact complete", { ...result });
+                }
+              })
+              .catch((err: unknown) => {
+                ctx.logger.warn("Auto-compact failed", { modelName: name, error: String(err) });
+                if (ctx.config.hooks?.onError) {
+                  ctx.config.hooks.onError(err as Error);
+                }
+              });
+          },
         }),
       );
     }
@@ -375,23 +428,322 @@ export const createOrionDB = (config: OrionDBConfig): OrionDB => {
   };
 
   // -------------------------------------------------------------------------
+  // compactModel / runCompaction (inner closures — access modelClients)
+  // -------------------------------------------------------------------------
+
+  // Per-model compaction lock — prevents concurrent compactions of the same model
+  // (e.g. auto-compact racing against an explicit $compact call).
+  const compactingModels = new Set<string>();
+
+  /**
+   * Core compaction algorithm for a single model.
+   *
+   * 1. Reads all lines from `data.ndjson` into memory.
+   * 2. Keeps only the latest version of each record (last-occurrence-wins).
+   * 3. Discards tombstones and stale versions.
+   * 4. Writes live records to a temp file then renames atomically.
+   * 5. Rebuilds the in-memory index from the new file.
+   * 6. Updates `meta.json` and the `FileSizeCounter`.
+   * 7. Re-attaches the model client with the fresh index manager.
+   *
+   * **Write safety:** If the process crashes mid-write, the original
+   * `data.ndjson` is untouched. The temp file is cleaned up on next
+   * `$connect`.
+   *
+   * **Index consistency:** The index is fully rebuilt from the new file
+   * after the atomic rename. All three index structures are replaced.
+   *
+   * **Concurrent access (Phase 1):** Compaction is not safe to run
+   * concurrently with writes to the same model. Auto-compact fires only
+   * from write methods which run serially through `operationTracker`.
+   * `$disconnect` drains in-flight operations before any external call.
+   */
+  async function runCompaction(
+    name: string,
+    paths: import("../persistence/index.js").ModelPaths,
+    ctx: ClientContext,
+  ): Promise<Omit<CompactionResult, "modelName" | "durationMs">> {
+    const dataFile = paths.dataFile;
+
+    // Step 1 — Read all lines
+    const content = await readFile(dataFile, "utf8");
+    const lines = content.split("\n").filter((line) => line.trim().length > 0);
+
+    // Step 2 — Build latest-version map (last-occurrence-wins)
+    const schema = ctx.allSchemas.get(name);
+    if (!schema) {
+      throw new CompactionError(`Schema not found for model '${name}' during compaction`, {
+        meta: { modelName: name },
+      });
+    }
+    const pkField = schema.primaryKeyField;
+    const latestVersions = new Map<string, Record<string, unknown>>();
+    let parseErrors = 0;
+
+    for (const line of lines) {
+      try {
+        const record = JSON.parse(line) as Record<string, unknown>;
+        const pk = record[pkField];
+        if (pk === null || pk === undefined) continue;
+        if (typeof pk !== "string" && typeof pk !== "number") continue;
+        // Always overwrite — later lines are newer versions
+        latestVersions.set(String(pk), record);
+      } catch {
+        parseErrors++;
+        ctx.logger.warn(`Skipping malformed line during compaction of '${name}'`);
+      }
+    }
+
+    // Step 3 — Filter to live records
+    const liveRecords: Record<string, unknown>[] = [];
+    let tombstonesRemoved = 0;
+
+    for (const record of latestVersions.values()) {
+      if (record["_deleted"] === true) {
+        tombstonesRemoved++;
+      } else {
+        liveRecords.push(record);
+      }
+    }
+
+    // Stale lines = total parsed lines minus the one-per-PK latest set
+    const staleLinesRemoved = lines.length - parseErrors - latestVersions.size;
+
+    // Step 4 — Write to temp file
+    const tempFile = `${dataFile}.compact.tmp`;
+    const newContent = liveRecords.map((r) => JSON.stringify(r)).join("\n");
+    const finalContent = newContent.length > 0 ? newContent + "\n" : "";
+
+    await writeFile(tempFile, finalContent, "utf8");
+
+    // Step 5 — Atomic rename
+    try {
+      await rename(tempFile, dataFile);
+    } catch (err) {
+      // Best-effort cleanup of temp file before rethrowing
+      try {
+        await unlink(tempFile);
+      } catch {
+        /* ignore */
+      }
+      throw new CompactionError(`Compaction failed during file rename for model '${name}'`, {
+        meta: { modelName: name, tempFile, dataFile, cause: err },
+      });
+    }
+
+    // Step 6 — Rebuild in-memory index from the compacted file
+    const freshIndex = new IndexManagerImpl<Record<string, unknown>>({
+      primaryKeyField: schema.primaryKeyField,
+      indexedFields: new Set(schema.indexedFields),
+    });
+    await freshIndex.rebuild(dataFile);
+    ctx.allIndexManagers.set(name, freshIndex);
+
+    // Step 7 — Update meta.json
+    await updateModelMeta(paths, {
+      recordCount: liveRecords.length,
+      tombstoneCount: 0,
+      lastCompactedAt: new Date().toISOString(),
+    });
+
+    // Step 8 — Update FileSizeCounter
+    const counter = ctx.allCounters.get(name);
+    if (counter) {
+      await counter.initialize(dataFile);
+    } else {
+      const freshCounter = new FileSizeCounter();
+      await freshCounter.initialize(dataFile);
+      ctx.allCounters.set(name, freshCounter);
+    }
+
+    // Step 9 — Re-attach model client with fresh index manager and counter
+    const freshCounter = ctx.allCounters.get(name);
+    if (paths && schema && freshCounter) {
+      const freshClient = createModelClient({
+        modelName: name,
+        paths,
+        schema,
+        indexManager: ctx.allIndexManagers.get(name) ?? freshIndex,
+        counter: freshCounter,
+        allSchemas: ctx.allSchemas,
+        allPaths: ctx.allPaths,
+        allIndexManagers: ctx.allIndexManagers,
+        allCounters: ctx.allCounters,
+        autoCompactThreshold: ctx.config.autoCompactThreshold,
+        isConnectedGetter: () => ctx.isConnected,
+        operationTracker,
+        strict: ctx.config.strict,
+        logger,
+        onShouldCompact: (n) => {
+          compactModel(n, ctx, { force: false })
+            .then((result) => {
+              if (result !== null) {
+                ctx.logger.info("Auto-compact complete", { ...result });
+              }
+            })
+            .catch((err: unknown) => {
+              ctx.logger.warn("Auto-compact failed", { modelName: n, error: String(err) });
+              if (ctx.config.hooks?.onError) {
+                ctx.config.hooks.onError(err as Error);
+              }
+            });
+        },
+      });
+      const clientKey = toCamelCaseKey(name);
+      modelClients.set(clientKey, freshClient);
+    }
+
+    // Step 10 — Collect file stats and return
+    const fileStat = await stat(dataFile);
+
+    return {
+      linesBeforeCompaction: lines.length,
+      linesAfterCompaction: liveRecords.length,
+      recordsRetained: liveRecords.length,
+      tombstonesRemoved,
+      staleLinesRemoved,
+      newFileSizeBytes: fileStat.size,
+    };
+  }
+
+  /**
+   * Compacts a single model. Checks the dead-line ratio against the threshold
+   * and skips if below threshold (unless `force` is set). Supports `dryRun`.
+   *
+   * Returns `null` when skipped (below threshold, `force` not set).
+   * Returns the full `CompactionResult` when compaction runs.
+   */
+  async function compactModel(
+    name: string,
+    ctx: ClientContext,
+    options: CompactOptions | undefined,
+  ): Promise<CompactionResult | null> {
+    const paths = ctx.allPaths.get(name);
+    if (!paths) {
+      throw new CompactionError(`Paths not found for model '${name}' during compaction`, {
+        meta: { modelName: name },
+      });
+    }
+
+    // Lock guard — skip if a compaction is already in progress for this model.
+    if (compactingModels.has(name)) {
+      ctx.logger.debug(`Skipping compaction for '${name}' — already in progress`);
+      return null;
+    }
+    compactingModels.add(name);
+
+    try {
+      // Step 1 — Read current meta
+      const meta = await readModelMeta(paths);
+
+      // Step 2 — Check threshold
+      const ratio = computeCompactionRatio(meta);
+      const threshold = ctx.config.autoCompactThreshold ?? 0.3;
+      const force = options?.force ?? false;
+      const dryRun = options?.dryRun ?? false;
+
+      if (!force && ratio < threshold) {
+        ctx.logger.debug(
+          `Skipping compaction for '${name}' \u2014 ratio ${ratio.toFixed(3)} below threshold ${threshold}`,
+        );
+        return null;
+      }
+
+      // Step 3 — Dry run path
+      if (dryRun) {
+        const liveLines = meta.recordCount;
+        const deadLines = meta.totalLines - liveLines;
+        ctx.logger.info(`[dry-run] Would compact '${name}'`, {
+          linesBeforeCompaction: meta.totalLines,
+          linesAfterCompaction: liveLines,
+          tombstonesRemoved: meta.tombstoneCount,
+          staleLinesRemoved: deadLines - meta.tombstoneCount,
+        });
+        return {
+          modelName: name,
+          linesBeforeCompaction: meta.totalLines,
+          linesAfterCompaction: liveLines,
+          recordsRetained: liveLines,
+          tombstonesRemoved: meta.tombstoneCount,
+          staleLinesRemoved: deadLines - meta.tombstoneCount,
+          durationMs: 0,
+          newFileSizeBytes: 0,
+        };
+      }
+
+      // Step 4 — Run compaction
+      const startTime = Date.now();
+      ctx.logger.info(`Compacting model '${name}'`, {
+        ratio: ratio.toFixed(3),
+        totalLines: meta.totalLines,
+        liveRecords: meta.recordCount,
+      });
+
+      const result = await runCompaction(name, paths, ctx);
+      const durationMs = Date.now() - startTime;
+
+      ctx.logger.info(`Compaction complete for '${name}'`, { durationMs, ...result });
+
+      return { modelName: name, durationMs, ...result };
+    } finally {
+      compactingModels.delete(name);
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // $compact
   // -------------------------------------------------------------------------
 
-  const $compact = (_modelName?: string): Promise<void> => {
+  /**
+   * Compacts one or all models, removing tombstones and stale record versions
+   * from `data.ndjson` and rebuilding in-memory indexes.
+   *
+   * **Write safety:** Writes to a `.compact.tmp` file first, then atomically
+   * renames. The original file is untouched if the process crashes mid-write.
+   *
+   * **No data loss:** Only records that are `_deleted: true` in their latest
+   * version are removed. Records that were updated retain their latest version.
+   *
+   * **Index consistency:** Indexes are fully rebuilt from the compacted file
+   * after the atomic rename completes.
+   *
+   * **Concurrent access (Phase 1):** Safe to call from outside the process
+   * only when `$disconnect` has been awaited first.
+   *
+   * @param modelName - Compact a single named model; omit to compact all.
+   * @param options - `force` bypasses the threshold; `dryRun` computes result
+   *   without writing.
+   * @returns Array of `CompactionResult` — one per model actually compacted.
+   *   Empty when below threshold and `force` is not set.
+   * @throws `OrionDBError` when called before `$connect()`.
+   * @throws `OrionDBError` when `modelName` is not registered.
+   * @throws `CompactionError` on file-rename failure.
+   */
+  const $compact = async (modelName?: string, options?: CompactOptions): Promise<CompactionResult[]> => {
+    // Step 1 — Connection guard
     if (!ctx.isConnected) {
-      return Promise.reject(
-        new QueryError("Cannot compact before calling $connect().", {
-          meta: { isConnected: false },
-        }),
-      );
+      throw new OrionDBError("Cannot call $compact() before $connect()", "ORIONDB_NOT_CONNECTED", {
+        meta: { reason: "not connected" },
+      });
     }
-    // Phase 1 stub — compaction is implemented in the compaction feature branch
-    return Promise.reject(
-      new QueryError("$compact is not yet implemented in Phase 1.", {
-        meta: { phase: 1 },
-      }),
-    );
+
+    // Step 2 — Validate and resolve models to compact
+    if (modelName !== undefined && !ctx.allSchemas.has(modelName)) {
+      throw new OrionDBError(`Cannot compact \u2014 model '${modelName}' not found`, "ORIONDB_MODEL_NOT_FOUND", {
+        meta: { modelName, knownModels: [...ctx.allSchemas.keys()] },
+      });
+    }
+
+    const modelsToCompact = modelName !== undefined ? [modelName] : [...ctx.allSchemas.keys()];
+
+    // Step 3 — Compact sequentially (parallel risks concurrent file writes)
+    const results: CompactionResult[] = [];
+    for (const name of modelsToCompact) {
+      const result = await compactModel(name, ctx, options);
+      if (result !== null) results.push(result);
+    }
+
+    return results;
   };
 
   // -------------------------------------------------------------------------

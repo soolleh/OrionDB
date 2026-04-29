@@ -10,21 +10,59 @@ import type {
   ModelWriterContext,
   ModelReaderContext,
 } from "../persistence/index.js";
-import type { ParsedModelDefinition, SchemaInput, SchemaMismatchStrategy } from "../schema/index.js";
+import type { ParsedModelDefinition, SchemaMismatchStrategy, SchemaDefinition } from "../schema/index.js";
 import type { IndexManager } from "../index-manager/index.js";
 import type { IncludeClause } from "../relations/index.js";
 import type { WhereInput, OrderByInput, SelectInput, AggregateResult, GroupByResult } from "../query/index.js";
 import type { Logger, LogLevel } from "./logger.js";
 
 // ---------------------------------------------------------------------------
-// SchemaDefinition
+// CompactionResult
 // ---------------------------------------------------------------------------
 
 /**
- * Map of model names to their raw schema inputs as passed to
- * `createOrionDB`. Parsed into `ParsedModelDefinition` during `$connect`.
+ * Result of a single model's compaction pass.
+ * Returned as one element in the `CompactionResult[]` array from `$compact`.
  */
-export type SchemaDefinition = Record<string, SchemaInput>;
+export interface CompactionResult {
+  /** Name of the compacted model. */
+  modelName: string;
+  /** Total lines in `data.ndjson` before compaction. */
+  linesBeforeCompaction: number;
+  /** Total lines in `data.ndjson` after compaction (= `recordsRetained`). */
+  linesAfterCompaction: number;
+  /** Number of live records retained in the compacted file. */
+  recordsRetained: number;
+  /** Number of tombstone lines (`_deleted: true`) removed. */
+  tombstonesRemoved: number;
+  /** Number of stale-version lines (superseded updates) removed. */
+  staleLinesRemoved: number;
+  /** Wall-clock duration of the compaction operation in milliseconds. */
+  durationMs: number;
+  /** Size of `data.ndjson` after compaction, in bytes. */
+  newFileSizeBytes: number;
+}
+
+// ---------------------------------------------------------------------------
+// CompactOptions
+// ---------------------------------------------------------------------------
+
+/**
+ * Options controlling the behaviour of `$compact`.
+ */
+export interface CompactOptions {
+  /**
+   * When `true`, compact even if the model is below the auto-compact
+   * threshold. Default: `false`.
+   */
+  force?: boolean;
+  /**
+   * When `true`, compute what would be compacted but do not write
+   * anything to disk. Returns `durationMs: 0` and `newFileSizeBytes: 0`.
+   * Default: `false`.
+   */
+  dryRun?: boolean;
+}
 
 // ---------------------------------------------------------------------------
 // OrionDBConfig
@@ -129,6 +167,14 @@ export interface ModelClientConfig {
    * warnings and other diagnostic messages.
    */
   logger?: Logger;
+  /**
+   * Fire-and-forget callback invoked when the auto-compact threshold is
+   * exceeded after a write. Signals the `OrionDB` instance to schedule
+   * compaction asynchronously without blocking the write return path.
+   * Never assigned directly by callers — wired by `createOrionDB` during
+   * `$connect`.
+   */
+  onShouldCompact?: (modelName: string) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -381,8 +427,11 @@ export interface OrionDBInstance {
   /**
    * Triggers manual compaction.
    * @param modelName - Compact a single model; omit to compact all models.
+   * @param options - Compaction options (`force`, `dryRun`).
+   * @returns Array of `CompactionResult` — one per model actually compacted.
+   *   Empty when the model is below threshold and `force` is not set.
    */
-  $compact(modelName?: string): Promise<void>;
+  $compact(modelName?: string, options?: CompactOptions): Promise<CompactionResult[]>;
   /**
    * Forces a full index rebuild from the NDJSON data file.
    * @param modelName - Rebuild for a single model; omit to rebuild all.

@@ -9,7 +9,7 @@ export default defineConfig({
     globals: true,
 
     // Test file patterns
-    include: ["**/*.test.ts", "**/*.spec.ts"],
+    include: ["tests/unit/**/*.test.ts", "tests/integration/**/*.test.ts", "tests/smoke/**/*.test.ts"],
 
     // Coverage configuration
     coverage: {

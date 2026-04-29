@@ -76,6 +76,24 @@ export type FieldDefinition =
 
 export type SchemaInput = Record<string, FieldDefinition>;
 
+/**
+ * Public alias for a single model's field map.
+ * Used to define the fields (and inline relations) for one model.
+ */
+export type ModelDefinition = SchemaInput;
+
+/**
+ * Public alias for a relation field definition.
+ * The `type` field holds the relation cardinality (`'one-to-many'`, etc.).
+ */
+export type RelationDefinition = RelationFieldDefinition;
+
+/**
+ * The top-level schema passed to `createOrionDB`.
+ * Maps model names to their field definitions.
+ */
+export type SchemaDefinition = Record<string, ModelDefinition>;
+
 // ---------------------------------------------------------------------------
 // Internal parsed representations
 // ---------------------------------------------------------------------------

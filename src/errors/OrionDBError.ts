@@ -16,8 +16,9 @@ export class OrionDBError extends Error {
     this.name = this.constructor.name;
     this.code = code;
 
-    if ((Error as any).captureStackTrace) {
-      (Error as any).captureStackTrace(this, this.constructor);
+    const errorCtor = Error as { captureStackTrace?: (target: object, fn: object) => void };
+    if (errorCtor.captureStackTrace) {
+      errorCtor.captureStackTrace(this, this.constructor);
     }
 
     if (options) {

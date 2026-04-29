@@ -2,7 +2,7 @@ import { createOrionDB } from "../src/client/index.js";
 
 const db = createOrionDB({
   dbLocation: "./scratch/mydb",
-  logLevel: "debug",
+  logLevel: "info",
   schema: {
     User: {
       id: { type: "string", primary: true, default: () => crypto.randomUUID() },
@@ -22,21 +22,29 @@ const db = createOrionDB({
 });
 
 await db.$connect();
-console.log("✅ Connected");
+await db.$disconnect();
+console.log("--- Disconnected ---");
 
-// CREATE a user
-const alice = await db.user.create({
-  data: {
-    name: "Alice",
-    email: "alice@example.com",
-    age: 30,
-  },
+// Reconnect with same dbLocation — no inline schema needed if _schema.json exists
+// For now re-pass the schema
+const db2 = createOrionDB({
+  dbLocation: "./scratch/mydb",
+  logLevel: "info",
 });
 
-console.log("Created user:", alice);
-console.log("Has id?", typeof alice.id === "string");
-console.log("No _deleted?", !("_deleted" in alice));
-console.log("No _createdAt?", !("_createdAt" in alice));
+await db2.$connect();
+console.log("--- Reconnected ---");
+// Alice should still be findable after full restart
+const aliceAfterRestart = await db2.user.findUnique({
+  where: { email: "alice@example.com" },
+});
+console.log("Alice survived restart:", aliceAfterRestart?.name === "Alice" ? "✅" : "❌");
+console.log("Alice age after update survived:", aliceAfterRestart?.age === 31 ? "✅" : "❌");
 
-await db.$disconnect();
-console.log("✅ Disconnected");
+// Bob should still be gone
+const bobAfterRestart = await db2.user.findUnique({
+  where: { email: "bob@example.com" },
+});
+console.log("Bob still gone after restart:", bobAfterRestart === null ? "✅" : "❌");
+
+await db2.$disconnect();

@@ -204,7 +204,7 @@ describe("update()", () => {
 
       // The new line (second line) should have the same _createdAt
       const lines = readFileSync(ctx.paths.dataFile, "utf8").trim().split("\n");
-      const lastLine = lines[lines.length - 1] as string;
+      const lastLine = lines[lines.length - 1];
       const newRaw = JSON.parse(lastLine) as Record<string, unknown>;
       expect(newRaw["_createdAt"]).toBe(originalCreatedAt);
     });
@@ -221,7 +221,7 @@ describe("update()", () => {
       await update(ctx, { where: { id: "u1" }, data: { name: "Alicia" } });
 
       const lines = readFileSync(ctx.paths.dataFile, "utf8").trim().split("\n");
-      const lastLine = lines[lines.length - 1] as string;
+      const lastLine = lines[lines.length - 1];
       const newUpdatedAt = (JSON.parse(lastLine) as Record<string, unknown>)["_updatedAt"];
       expect(newUpdatedAt).not.toBe(originalUpdatedAt);
     });
@@ -479,7 +479,7 @@ describe("deleteRecord()", () => {
       await deleteRecord(ctx, { where: { id: "u1" } });
 
       const lines = readFileSync(ctx.paths.dataFile, "utf8").trim().split("\n");
-      const lastLine = lines[lines.length - 1] as string;
+      const lastLine = lines[lines.length - 1];
       const tombstone = JSON.parse(lastLine) as Record<string, unknown>;
       expect(tombstone["_deleted"]).toBe(true);
       expect(tombstone["id"]).toBe("u1");
@@ -489,13 +489,13 @@ describe("deleteRecord()", () => {
       const ctx = await makeWriterContext();
       await seedRecord(ctx, { id: "u1", name: "Alice" });
 
-      const firstLine = readFileSync(ctx.paths.dataFile, "utf8").trim().split("\n")[0] as string;
+      const firstLine = readFileSync(ctx.paths.dataFile, "utf8").trim().split("\n")[0];
       const originalCreatedAt = (JSON.parse(firstLine) as Record<string, unknown>)["_createdAt"];
 
       await deleteRecord(ctx, { where: { id: "u1" } });
 
       const lines = readFileSync(ctx.paths.dataFile, "utf8").trim().split("\n");
-      const tombstoneLine = lines[lines.length - 1] as string;
+      const tombstoneLine = lines[lines.length - 1];
       const tombstone = JSON.parse(tombstoneLine) as Record<string, unknown>;
       expect(tombstone["_createdAt"]).toBe(originalCreatedAt);
     });

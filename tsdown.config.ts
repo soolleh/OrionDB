@@ -8,4 +8,5 @@ export default defineConfig({
   sourcemap: true,
   clean: true,
   minify: false,
+  outExtensions: () => ({ js: ".js", dts: ".d.ts" }),
 });

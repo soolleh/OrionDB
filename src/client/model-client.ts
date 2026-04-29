@@ -17,6 +17,7 @@ import {
   deleteMany as persistenceDeleteMany,
 } from "../persistence/index.js";
 import type { ModelReaderContext, ModelWriterContext, FindManyArgs } from "../persistence/index.js";
+import { shouldAutoCompact } from "../persistence/index.js";
 import {
   compileFilter,
   compileSort,
@@ -28,7 +29,7 @@ import {
   groupBy as queryGroupBy,
 } from "../query/index.js";
 import type { SelectInput, AggregateResult, GroupByResult } from "../query/index.js";
-import { QueryError, ValidationError } from "../errors/index.js";
+import { QueryError, ValidationError, RelationError } from "../errors/index.js";
 import type {
   ModelClientConfig,
   ModelClientMethods,
@@ -46,6 +47,20 @@ import type {
   DeleteManyInput,
   UpsertInput,
 } from "./types.js";
+import {
+  resolveIncludes,
+  attachIncludes,
+  extractNestedWrites,
+  executeNestedWrites,
+  resolveConnectForeignKey,
+} from "../relations/index.js";
+import type {
+  RelationResolverContext,
+  FindManyForResolver,
+  IncludeClause,
+  NestedWriteOperation,
+} from "../relations/index.js";
+import type { ParsedModelDefinition } from "../schema/index.js";
 
 // ---------------------------------------------------------------------------
 // assertConnected
@@ -103,23 +118,6 @@ export const createModelClient = (config: ModelClientConfig): ModelClientMethods
     counter: config.counter,
     autoCompactThreshold: config.autoCompactThreshold,
   });
-
-  /**
-   * Removes relation fields from a data object before passing to the
-   * persistence layer. Persistence has no knowledge of relations and
-   * would reject them as unknown fields.
-   *
-   * Phase 1 stub — replaced by `extractNestedWrites` in prompt 8.4.
-   */
-  const stripRelationFields = (data: Record<string, unknown>): Record<string, unknown> => {
-    const result: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(data)) {
-      if (!config.schema.relationFields.has(key)) {
-        result[key] = value;
-      }
-    }
-    return result;
-  };
 
   /**
    * When `config.strict` is `true`, throws `ValidationError` for any field
@@ -181,6 +179,162 @@ export const createModelClient = (config: ModelClientConfig): ModelClientMethods
   });
 
   // ---------------------------------------------------------------------------
+  // Include and nested write helpers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Builds an injected `findMany` function for the relation resolver.
+   * Looks up per-model reader context from the cross-model registries.
+   */
+  const buildFindManyForResolver = (): FindManyForResolver => {
+    return async (relatedModelName: string, filter: (record: Record<string, unknown>) => boolean) => {
+      const paths = config.allPaths.get(relatedModelName);
+      const schema = config.allSchemas.get(relatedModelName);
+      const indexManager = config.allIndexManagers.get(relatedModelName);
+
+      if (!paths || !schema || !indexManager) {
+        throw new RelationError(`Cannot resolve relation — model '${relatedModelName}' not found in registry`, {
+          model: config.modelName,
+          meta: { relatedModel: relatedModelName, reason: "model not in allSchemas registry" },
+        });
+      }
+
+      const readerCtx: ModelReaderContext = {
+        modelName: relatedModelName,
+        paths,
+        schema,
+        indexManager,
+      };
+
+      return persistenceFindMany(readerCtx, {}, filter);
+    };
+  };
+
+  /**
+   * Builds the `RelationResolverContext` used by `resolveIncludes`.
+   */
+  const buildResolverCtx = (): RelationResolverContext => ({
+    modelName: config.modelName,
+    schema: config.schema,
+    allSchemas: config.allSchemas,
+    findMany: buildFindManyForResolver(),
+  });
+
+  /**
+   * Resolves `include` clauses for a single record and merges the
+   * resolved relations back onto the record.
+   * Returns the original reference when `include` is `undefined`.
+   */
+  const resolveAndAttach = async (
+    record: Record<string, unknown>,
+    include: IncludeClause | undefined,
+  ): Promise<Record<string, unknown>> => {
+    if (!include) return record;
+    const resolverCtx = buildResolverCtx();
+    const pkField = config.schema.primaryKeyField;
+    const includeResult = await resolveIncludes(resolverCtx, [record], include);
+    const [attached] = attachIncludes([record], includeResult, pkField);
+    return attached ?? record;
+  };
+
+  /**
+   * Resolves `include` clauses for an array of records and merges the
+   * resolved relations back onto each record.
+   * Returns the original array reference when `include` is `undefined` or
+   * the array is empty.
+   */
+  const resolveAndAttachMany = async (
+    records: Record<string, unknown>[],
+    include: IncludeClause | undefined,
+  ): Promise<Record<string, unknown>[]> => {
+    if (!include || records.length === 0) return records;
+    const resolverCtx = buildResolverCtx();
+    const pkField = config.schema.primaryKeyField;
+    const includeResult = await resolveIncludes(resolverCtx, records, include);
+    return attachIncludes(records, includeResult, pkField);
+  };
+
+  /**
+   * Builds the execution context injected into `executeNestedWrites`.
+   * Constructs per-model writer contexts from the cross-model registries.
+   */
+  const buildExecuteContext = () => ({
+    createRecord: async (nestedModelName: string, data: Record<string, unknown>) => {
+      const paths = config.allPaths.get(nestedModelName);
+      const schema = config.allSchemas.get(nestedModelName);
+      const indexManager = config.allIndexManagers.get(nestedModelName);
+      const counter = config.allCounters.get(nestedModelName);
+
+      if (!paths || !schema || !indexManager || !counter) {
+        throw new RelationError(`Cannot nested-create — model '${nestedModelName}' not found in registry`, {
+          model: config.modelName,
+          meta: { relatedModel: nestedModelName },
+        });
+      }
+
+      const writerCtx: ModelWriterContext = {
+        modelName: nestedModelName,
+        paths,
+        schema,
+        indexManager,
+        counter,
+      };
+
+      return persistenceCreate(writerCtx, { data });
+    },
+
+    updateRecord: async (nestedModelName: string, where: Record<string, unknown>, data: Record<string, unknown>) => {
+      const paths = config.allPaths.get(nestedModelName);
+      const schema = config.allSchemas.get(nestedModelName);
+      const indexManager = config.allIndexManagers.get(nestedModelName);
+      const counter = config.allCounters.get(nestedModelName);
+
+      if (!paths || !schema || !indexManager || !counter) {
+        throw new RelationError(`Cannot nested-update — model '${nestedModelName}' not found in registry`, {
+          model: config.modelName,
+          meta: { relatedModel: nestedModelName },
+        });
+      }
+
+      const writerCtx: ModelWriterContext = {
+        modelName: nestedModelName,
+        paths,
+        schema,
+        indexManager,
+        counter,
+      };
+
+      return persistenceUpdate(writerCtx, { where, data });
+    },
+  });
+
+  /**
+   * For `many-to-one` connect operations, injects the FK into the parent's
+   * `cleanData` before the parent write. No-op for other relation types.
+   */
+  const injectConnectForeignKeys = (
+    cleanData: Record<string, unknown>,
+    operations: NestedWriteOperation[],
+    allSchemas: Map<string, ParsedModelDefinition>,
+  ): Record<string, unknown> => {
+    let data = { ...cleanData };
+
+    for (const op of operations) {
+      if (op.relationType !== "many-to-one") continue;
+
+      const connectRecords = op.records.filter((r) => r["_nestedOp"] === "connect");
+      for (const connectRecord of connectRecords) {
+        const where = { ...connectRecord };
+        delete where["_nestedOp"];
+        const { field, value } = resolveConnectForeignKey(op, where, allSchemas);
+        data = { ...data, [field]: value };
+      }
+    }
+
+    return data;
+  };
+
+  // ---------------------------------------------------------------------------
   // Read methods
   // ---------------------------------------------------------------------------
 
@@ -195,11 +349,10 @@ export const createModelClient = (config: ModelClientConfig): ModelClientMethods
         const readerCtx = buildReaderCtx();
         const record = await persistenceFindUnique(readerCtx, {
           where: input.where,
-          select: input.select,
         });
         if (record === null) return null;
-        // TODO: include — wired in prompt 8.4
-        return applySelect(record, input.select);
+        const withIncludes = await resolveAndAttach(record, input.include);
+        return applySelect(withIncludes, input.select);
       })(),
     );
   };
@@ -215,10 +368,9 @@ export const createModelClient = (config: ModelClientConfig): ModelClientMethods
         const readerCtx = buildReaderCtx();
         const record = await persistenceFindUniqueOrThrow(readerCtx, {
           where: input.where,
-          select: input.select,
         });
-        // TODO: include — wired in prompt 8.4
-        return applySelect(record, input.select);
+        const withIncludes = await resolveAndAttach(record, input.include);
+        return applySelect(withIncludes, input.select);
       })(),
     );
   };
@@ -245,19 +397,15 @@ export const createModelClient = (config: ModelClientConfig): ModelClientMethods
           const sorted = applySort(records, compiledSort);
           const first = sorted[0] ?? null;
           if (first === null) return null;
-          // TODO: include — wired in prompt 8.4
-          return applySelect(first, input.select);
+          const withIncludes = await resolveAndAttach(first, input.include);
+          return applySelect(withIncludes, input.select);
         }
 
         // No orderBy — delegate to persistence early-exit (take: 1)
-        const record = await persistenceFindFirst(
-          readerCtx,
-          { where: input.where, select: input.select },
-          compiledFilter,
-        );
+        const record = await persistenceFindFirst(readerCtx, { where: input.where }, compiledFilter);
         if (record === null) return null;
-        // TODO: include — wired in prompt 8.4
-        return applySelect(record, input.select);
+        const withIncludes = await resolveAndAttach(record, input.include);
+        return applySelect(withIncludes, input.select);
       })(),
     );
   };
@@ -289,9 +437,8 @@ export const createModelClient = (config: ModelClientConfig): ModelClientMethods
         // applyPagination is a no-op when both postSkip and postTake are undefined
         const paginated = applyPagination(sorted, strategy.postSkip, strategy.postTake);
 
-        // TODO: include — wired in prompt 8.4
-
-        return applySelectMany(paginated, input.select);
+        const withIncludes = await resolveAndAttachMany(paginated, input.include);
+        return applySelectMany(withIncludes, input.select);
       })(),
     );
   };
@@ -373,26 +520,35 @@ export const createModelClient = (config: ModelClientConfig): ModelClientMethods
   /**
    * Creates a single record. Validates fields, applies defaults, checks unique
    * constraints, writes to disk, updates indexes, and returns the new record.
+   *
+   * Note: nested write execution is non-atomic. If the parent write succeeds
+   * but a nested child write fails, the parent record exists in the database
+   * with no children. There is no transaction rollback in Phase 1.
    */
   const create = (input: CreateInput): Promise<Record<string, unknown>> => {
     assertConnected(isConnectedGetter, modelName, "create");
     return operationTracker.track(
       (async () => {
-        // Strict mode before strip — relation fields are valid in strict mode
         assertStrictMode(input.data, "create");
 
-        // TODO: nested writes — wired in prompt 8.4
-        const cleanData = stripRelationFields(input.data);
+        const { cleanData, operations } = extractNestedWrites(input.data, config.schema, config.allSchemas);
+
+        const finalData = injectConnectForeignKeys(cleanData, operations, config.allSchemas);
 
         const writerCtx = buildWriterCtx();
-        const record = await persistenceCreate(writerCtx, { data: cleanData });
+        const record = await persistenceCreate(writerCtx, { data: finalData });
 
-        // TODO: auto-compact trigger — wired in prompt 13.5
+        const parentPk = record[config.schema.primaryKeyField];
+        await executeNestedWrites(operations, parentPk, buildExecuteContext());
+
+        if (config.onShouldCompact) {
+          const doCompact = await shouldAutoCompact(config.paths, config.autoCompactThreshold);
+          if (doCompact) config.onShouldCompact(config.modelName);
+        }
         config.logger?.debug(`[${modelName}] create complete`);
 
-        // TODO: include — wired in prompt 8.4
-
-        return applySelect(record, input.select);
+        const withIncludes = await resolveAndAttach(record, input.include);
+        return applySelect(withIncludes, input.select);
       })(),
     );
   };
@@ -415,12 +571,16 @@ export const createModelClient = (config: ModelClientConfig): ModelClientMethods
           assertStrictMode(record, "create");
         }
 
-        // TODO: nested writes — wired in prompt 8.4
-        const cleanRecords = input.data.map(stripRelationFields);
+        // createMany: strip relation fields, no nested write execution
+        // Nested writes in bulk creates are Phase 2
+        const cleanRecords = input.data.map((d) => extractNestedWrites(d, config.schema, config.allSchemas).cleanData);
 
         const result = await persistenceCreateMany(writerCtx, { data: cleanRecords });
 
-        // TODO: auto-compact trigger — wired in prompt 13.5
+        if (config.onShouldCompact) {
+          const doCompact = await shouldAutoCompact(config.paths, config.autoCompactThreshold);
+          if (doCompact) config.onShouldCompact(config.modelName);
+        }
         config.logger?.debug(`[${modelName}] createMany complete`, { count: result.count });
 
         return result;
@@ -431,16 +591,18 @@ export const createModelClient = (config: ModelClientConfig): ModelClientMethods
   /**
    * Updates the single record identified by `where`. Throws `RecordNotFoundError`
    * when no matching record exists. Returns the updated record.
+   *
+   * Note: nested write execution is non-atomic. If the parent write succeeds
+   * but a nested child write fails, the parent record exists in the database
+   * with no children. There is no transaction rollback in Phase 1.
    */
   const update = (input: UpdateInput): Promise<Record<string, unknown>> => {
     assertConnected(isConnectedGetter, modelName, "update");
     return operationTracker.track(
       (async () => {
-        // Strict mode on raw data before strip
         assertStrictMode(input.data, "update");
 
-        // TODO: nested writes — wired in prompt 8.4
-        const cleanData = stripRelationFields(input.data);
+        const { cleanData, operations } = extractNestedWrites(input.data, config.schema, config.allSchemas);
 
         const writerCtx = buildWriterCtx();
         // persistenceUpdate handles RecordNotFoundError internally with
@@ -450,12 +612,17 @@ export const createModelClient = (config: ModelClientConfig): ModelClientMethods
           data: cleanData,
         });
 
-        // TODO: auto-compact trigger — wired in prompt 13.5
+        const parentPk = record[config.schema.primaryKeyField];
+        await executeNestedWrites(operations, parentPk, buildExecuteContext());
+
+        if (config.onShouldCompact) {
+          const doCompact = await shouldAutoCompact(config.paths, config.autoCompactThreshold);
+          if (doCompact) config.onShouldCompact(config.modelName);
+        }
         config.logger?.debug(`[${modelName}] update complete`);
 
-        // TODO: include — wired in prompt 8.4
-
-        return applySelect(record, input.select);
+        const withIncludes = await resolveAndAttach(record, input.include);
+        return applySelect(withIncludes, input.select);
       })(),
     );
   };
@@ -470,15 +637,19 @@ export const createModelClient = (config: ModelClientConfig): ModelClientMethods
       (async () => {
         assertStrictMode(input.data, "update");
 
-        // TODO: nested writes — wired in prompt 8.4
-        const cleanData = stripRelationFields(input.data);
+        // updateMany: strip relation fields, no nested write execution
+        // Nested writes in bulk updates are Phase 2
+        const { cleanData } = extractNestedWrites(input.data, config.schema, config.allSchemas);
 
         const writerCtx = buildWriterCtx();
         const compiledFilter = input.where ? compileFilter(input.where) : undefined;
 
         const result = await persistenceUpdateMany(writerCtx, { where: input.where, data: cleanData }, compiledFilter);
 
-        // TODO: auto-compact trigger — wired in prompt 13.5
+        if (config.onShouldCompact) {
+          const doCompact = await shouldAutoCompact(config.paths, config.autoCompactThreshold);
+          if (doCompact) config.onShouldCompact(config.modelName);
+        }
         config.logger?.debug(`[${modelName}] updateMany complete`, { count: result.count });
 
         return result;
@@ -498,7 +669,10 @@ export const createModelClient = (config: ModelClientConfig): ModelClientMethods
         const writerCtx = buildWriterCtx();
         const record = await persistenceDelete(writerCtx, { where: input.where });
 
-        // TODO: auto-compact trigger — wired in prompt 13.5
+        if (config.onShouldCompact) {
+          const doCompact = await shouldAutoCompact(config.paths, config.autoCompactThreshold);
+          if (doCompact) config.onShouldCompact(config.modelName);
+        }
         config.logger?.debug(`[${modelName}] delete complete`);
 
         return record;
@@ -520,7 +694,10 @@ export const createModelClient = (config: ModelClientConfig): ModelClientMethods
 
         const result = await persistenceDeleteMany(writerCtx, { where: input.where }, compiledFilter);
 
-        // TODO: auto-compact trigger — wired in prompt 13.5
+        if (config.onShouldCompact) {
+          const doCompact = await shouldAutoCompact(config.paths, config.autoCompactThreshold);
+          if (doCompact) config.onShouldCompact(config.modelName);
+        }
         config.logger?.debug(`[${modelName}] deleteMany complete`, { count: result.count });
 
         return result;
@@ -535,6 +712,10 @@ export const createModelClient = (config: ModelClientConfig): ModelClientMethods
    *
    * Note: upsert is a find-then-write operation, not atomic in Phase 1.
    * Concurrent upserts on the same record may race.
+   *
+   * Note: nested write execution is non-atomic. If the parent write succeeds
+   * but a nested child write fails, the parent record exists in the database
+   * with no children. There is no transaction rollback in Phase 1.
    */
   const upsert = (input: UpsertInput): Promise<Record<string, unknown>> => {
     assertConnected(isConnectedGetter, modelName, "upsert");
@@ -546,29 +727,38 @@ export const createModelClient = (config: ModelClientConfig): ModelClientMethods
         if (existing !== null) {
           // Record exists — update path
           assertStrictMode(input.update, "update");
-          const cleanUpdate = stripRelationFields(input.update);
+          const { cleanData: cleanUpdate, operations: updateOps } = extractNestedWrites(
+            input.update,
+            config.schema,
+            config.allSchemas,
+          );
           const writerCtx = buildWriterCtx();
           const updated = await persistenceUpdate(writerCtx, {
             where: input.where,
             data: cleanUpdate,
           });
+          const parentPk = updated[config.schema.primaryKeyField];
+          await executeNestedWrites(updateOps, parentPk, buildExecuteContext());
 
-          // TODO: auto-compact trigger — wired in prompt 13.5
-          // TODO: include — wired in prompt 8.4
-
-          return applySelect(updated, input.select);
+          const withIncludes = await resolveAndAttach(updated, input.include);
+          return applySelect(withIncludes, input.select);
         }
 
         // Record does not exist — create path
         assertStrictMode(input.create, "create");
-        const cleanCreate = stripRelationFields(input.create);
+        const { cleanData: cleanCreate, operations: createOps } = extractNestedWrites(
+          input.create,
+          config.schema,
+          config.allSchemas,
+        );
+        const finalCreate = injectConnectForeignKeys(cleanCreate, createOps, config.allSchemas);
         const writerCtx = buildWriterCtx();
-        const created = await persistenceCreate(writerCtx, { data: cleanCreate });
+        const created = await persistenceCreate(writerCtx, { data: finalCreate });
+        const parentPk = created[config.schema.primaryKeyField];
+        await executeNestedWrites(createOps, parentPk, buildExecuteContext());
 
-        // TODO: auto-compact trigger — wired in prompt 13.5
-        // TODO: include — wired in prompt 8.4
-
-        return applySelect(created, input.select);
+        const withIncludes = await resolveAndAttach(created, input.include);
+        return applySelect(withIncludes, input.select);
       })(),
     );
   };
