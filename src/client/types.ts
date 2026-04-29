@@ -3,11 +3,28 @@
 // All client-layer type definitions for OrionDB.
 // Types and interfaces only — zero runtime logic.
 
-import type { ModelPaths, FileSizeCounter, ModelWriterContext, ModelReaderContext } from "../persistence/index.js";
-import type { ParsedModelDefinition } from "../schema/index.js";
+import type {
+  ModelPaths,
+  DatabasePaths,
+  FileSizeCounter,
+  ModelWriterContext,
+  ModelReaderContext,
+} from "../persistence/index.js";
+import type { ParsedModelDefinition, SchemaInput, SchemaMismatchStrategy } from "../schema/index.js";
 import type { IndexManager } from "../index-manager/index.js";
 import type { IncludeClause } from "../relations/index.js";
 import type { WhereInput, OrderByInput, SelectInput, AggregateResult, GroupByResult } from "../query/index.js";
+import type { Logger, LogLevel } from "./logger.js";
+
+// ---------------------------------------------------------------------------
+// SchemaDefinition
+// ---------------------------------------------------------------------------
+
+/**
+ * Map of model names to their raw schema inputs as passed to
+ * `createOrionDB`. Parsed into `ParsedModelDefinition` during `$connect`.
+ */
+export type SchemaDefinition = Record<string, SchemaInput>;
 
 // ---------------------------------------------------------------------------
 // OrionDBConfig
@@ -20,6 +37,21 @@ export interface OrionDBConfig {
   /** Folder path where the database files are stored. */
   dbLocation: string;
   /**
+   * Model schemas, keyed by model name.
+   * Parsed and validated during `$connect`.
+   */
+  schema?: SchemaDefinition;
+  /**
+   * How to handle a mismatch between the code-defined schema and the
+   * schema snapshot on disk. Default: `'block'`.
+   */
+  schemaMismatchStrategy?: SchemaMismatchStrategy;
+  /**
+   * When `true`, auto-compaction runs after each delete operation.
+   * Default: `true`.
+   */
+  autoCompact?: boolean;
+  /**
    * Fraction of tombstone lines that triggers auto-compaction.
    * Default: 0.30 (30%).
    */
@@ -30,6 +62,11 @@ export interface OrionDBConfig {
    * Default: `false`.
    */
   strict?: boolean;
+  /**
+   * Minimum log level for internal OrionDB messages.
+   * Default: `'warn'`.
+   */
+  logLevel?: LogLevel;
 }
 
 // ---------------------------------------------------------------------------
@@ -311,7 +348,7 @@ export type ModelRegistry = {
  */
 export interface OrionDBInstance {
   /** Initializes all model directories and rebuilds in-memory indexes. */
-  $connect(): Promise<void>;
+  $connect(options?: ConnectOptions): Promise<void>;
   /** Flushes pending operations and releases file handles. */
   $disconnect(): Promise<void>;
   /**
@@ -348,6 +385,10 @@ export type OrionDB = OrionDBInstance & ModelRegistry;
 export interface ClientContext {
   /** Top-level database configuration. */
   config: OrionDBConfig;
+  /** Resolved file-system paths for the database root. */
+  dbPaths: DatabasePaths;
+  /** Internal logger scoped to this instance. */
+  logger: Logger;
   /** Parsed schema definitions for all models. */
   allSchemas: Map<string, ParsedModelDefinition>;
   /** Resolved file-system paths for all models. */
@@ -393,3 +434,37 @@ export type ContextBuilder = {
   writerCtx: (modelName: string, clientCtx: ClientContext) => ModelWriterContext;
   readerCtx: (modelName: string, clientCtx: ClientContext) => ModelReaderContext;
 };
+
+// ---------------------------------------------------------------------------
+// StartupResult
+// ---------------------------------------------------------------------------
+
+/**
+ * Diagnostic data returned per model after a successful `$connect` or
+ * `$rebuildIndexes` call.
+ */
+export interface StartupResult {
+  /** The model that was initialized. */
+  modelName: string;
+  /** Record count read from `meta.json` at startup. */
+  recordCount: number;
+  /** Number of live (non-deleted) records indexed in memory. */
+  indexedCount: number;
+  /** Current byte size of `data.ndjson` after initialization. */
+  dataFileSizeBytes: number;
+}
+
+// ---------------------------------------------------------------------------
+// ConnectOptions
+// ---------------------------------------------------------------------------
+
+/**
+ * Optional arguments accepted by `$connect()`.
+ */
+export interface ConnectOptions {
+  /**
+   * When `true`, forces a full re-initialization even if `$connect()`
+   * has already been called. Default: `false`.
+   */
+  force?: boolean;
+}
