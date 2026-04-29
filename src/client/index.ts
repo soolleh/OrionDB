@@ -26,6 +26,9 @@ export type {
   ContextBuilder,
   StartupResult,
   ConnectOptions,
+  DisconnectOptions,
+  LifecycleHooks,
+  OperationTrackerInterface,
 } from "./types.js";
 
 export { createModelClient, assertConnected } from "./model-client.js";

@@ -67,6 +67,12 @@ export interface OrionDBConfig {
    * Default: `'warn'`.
    */
   logLevel?: LogLevel;
+  /**
+   * Optional lifecycle hooks invoked on connect and disconnect.
+   * Hook failures are swallowed — they never cause `$connect` or
+   * `$disconnect` to fail.
+   */
+  hooks?: LifecycleHooks;
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +108,16 @@ export interface ModelClientConfig {
    * top-level config. Default: 0.30.
    */
   autoCompactThreshold?: number;
+  /**
+   * Getter that returns the current connection state from the shared
+   * `ClientContext`. Always returns the live value — never a snapshot.
+   */
+  isConnectedGetter: () => boolean;
+  /**
+   * Shared operation tracker used to drain in-flight async operations
+   * before `$disconnect` clears state.
+   */
+  operationTracker: OperationTrackerInterface;
 }
 
 // ---------------------------------------------------------------------------
@@ -350,7 +366,7 @@ export interface OrionDBInstance {
   /** Initializes all model directories and rebuilds in-memory indexes. */
   $connect(options?: ConnectOptions): Promise<void>;
   /** Flushes pending operations and releases file handles. */
-  $disconnect(): Promise<void>;
+  $disconnect(options?: DisconnectOptions): Promise<void>;
   /**
    * Triggers manual compaction.
    * @param modelName - Compact a single model; omit to compact all models.
@@ -361,6 +377,11 @@ export interface OrionDBInstance {
    * @param modelName - Rebuild for a single model; omit to rebuild all.
    */
   $rebuildIndexes(modelName?: string): Promise<void>;
+  /**
+   * Read-only `true` after `$connect()` resolves, `false` otherwise.
+   * Accessible before `$connect()` — no connection guard applied.
+   */
+  readonly $isConnected: boolean;
 }
 
 /**
@@ -467,4 +488,66 @@ export interface ConnectOptions {
    * has already been called. Default: `false`.
    */
   force?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// DisconnectOptions
+// ---------------------------------------------------------------------------
+
+/**
+ * Optional arguments accepted by `$disconnect()`.
+ */
+export interface DisconnectOptions {
+  /**
+   * When `true`, skips draining in-flight operations and clears state
+   * immediately. Default: `false`.
+   */
+  force?: boolean;
+  /**
+   * Milliseconds to wait for in-flight operations before forcing
+   * disconnect. Default: `5000`. Use `0` for no ceiling.
+   */
+  timeout?: number;
+}
+
+// ---------------------------------------------------------------------------
+// LifecycleHooks
+// ---------------------------------------------------------------------------
+
+/**
+ * Optional hooks called at connection lifecycle events.
+ * Hook failures are never propagated — they are passed to `onError` if
+ * provided, then swallowed.
+ */
+export interface LifecycleHooks {
+  /** Called at the end of a successful `$connect()`. */
+  onConnect?: () => void | Promise<void>;
+  /** Called at the end of `$disconnect()`, after state is fully cleared. */
+  onDisconnect?: () => void | Promise<void>;
+  /**
+   * Called synchronously (never awaited) whenever a lifecycle hook throws.
+   * Use this for error reporting or telemetry.
+   */
+  onError?: (error: unknown) => void;
+}
+
+// ---------------------------------------------------------------------------
+// OperationTrackerInterface
+// ---------------------------------------------------------------------------
+
+/**
+ * Structural interface for the private `OperationTracker` class.
+ * Used as the type of `ModelClientConfig.operationTracker` so the
+ * class itself does not need to be exported.
+ */
+export interface OperationTrackerInterface {
+  /** Registers `operation` for drain tracking and returns it unchanged. */
+  track<T>(operation: Promise<T>): Promise<T>;
+  /**
+   * Waits for all registered operations to settle (resolve or reject).
+   * Returns immediately when there are no pending operations.
+   */
+  drain(): Promise<void>;
+  /** Number of currently tracked (pending) operations. */
+  readonly size: number;
 }

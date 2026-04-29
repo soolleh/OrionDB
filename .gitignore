@@ -61,3 +61,4 @@ temp/
 tests/**/*.db/
 tests/**/testdb/
 tmp-db/
+scratch/
