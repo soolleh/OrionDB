@@ -118,6 +118,17 @@ export interface ModelClientConfig {
    * before `$disconnect` clears state.
    */
   operationTracker: OperationTrackerInterface;
+  /**
+   * When `true`, unknown fields in `create` or `update` data throw
+   * `ValidationError` instead of being silently ignored.
+   * Mirrors `OrionDBConfig.strict`. Default: `false`.
+   */
+  strict?: boolean;
+  /**
+   * Logger scoped to this OrionDB instance. Used for auto-compact
+   * warnings and other diagnostic messages.
+   */
+  logger?: Logger;
 }
 
 // ---------------------------------------------------------------------------

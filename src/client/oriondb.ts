@@ -272,6 +272,8 @@ export const createOrionDB = (config: OrionDBConfig): OrionDB => {
           autoCompactThreshold: ctx.config.autoCompactThreshold,
           isConnectedGetter: () => ctx.isConnected,
           operationTracker,
+          strict: ctx.config.strict,
+          logger,
         }),
       );
     }

@@ -9,8 +9,14 @@ import {
   findUniqueOrThrow as persistenceFindUniqueOrThrow,
   findFirst as persistenceFindFirst,
   findMany as persistenceFindMany,
+  create as persistenceCreate,
+  createMany as persistenceCreateMany,
+  update as persistenceUpdate,
+  updateMany as persistenceUpdateMany,
+  deleteRecord as persistenceDelete,
+  deleteMany as persistenceDeleteMany,
 } from "../persistence/index.js";
-import type { ModelReaderContext, FindManyArgs } from "../persistence/index.js";
+import type { ModelReaderContext, ModelWriterContext, FindManyArgs } from "../persistence/index.js";
 import {
   compileFilter,
   compileSort,
@@ -22,7 +28,7 @@ import {
   groupBy as queryGroupBy,
 } from "../query/index.js";
 import type { SelectInput, AggregateResult, GroupByResult } from "../query/index.js";
-import { QueryError } from "../errors/index.js";
+import { QueryError, ValidationError } from "../errors/index.js";
 import type {
   ModelClientConfig,
   ModelClientMethods,
@@ -32,6 +38,13 @@ import type {
   CountInput,
   AggregateClientInput,
   GroupByClientInput,
+  CreateInput,
+  CreateManyInput,
+  UpdateInput,
+  UpdateManyInput,
+  DeleteInput,
+  DeleteManyInput,
+  UpsertInput,
 } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -80,6 +93,53 @@ export const createModelClient = (config: ModelClientConfig): ModelClientMethods
     schema: config.schema,
     indexManager: config.indexManager,
   });
+
+  /** Builds the persistence writer context from this client's config. */
+  const buildWriterCtx = (): ModelWriterContext => ({
+    modelName: config.modelName,
+    paths: config.paths,
+    schema: config.schema,
+    indexManager: config.indexManager,
+    counter: config.counter,
+    autoCompactThreshold: config.autoCompactThreshold,
+  });
+
+  /**
+   * Removes relation fields from a data object before passing to the
+   * persistence layer. Persistence has no knowledge of relations and
+   * would reject them as unknown fields.
+   *
+   * Phase 1 stub — replaced by `extractNestedWrites` in prompt 8.4.
+   */
+  const stripRelationFields = (data: Record<string, unknown>): Record<string, unknown> => {
+    const result: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(data)) {
+      if (!config.schema.relationFields.has(key)) {
+        result[key] = value;
+      }
+    }
+    return result;
+  };
+
+  /**
+   * When `config.strict` is `true`, throws `ValidationError` for any field
+   * in `data` that is not declared in the schema (scalar or relation).
+   * Relation fields are explicitly permitted — they will be processed as
+   * nested writes in prompt 8.4.
+   * No-op when `config.strict` is falsy.
+   */
+  const assertStrictMode = (data: Record<string, unknown>, operation: "create" | "update"): void => {
+    if (!config.strict) return;
+    for (const key of Object.keys(data)) {
+      if (!config.schema.fields.has(key) && !config.schema.relationFields.has(key)) {
+        throw new ValidationError(`Unknown field '${key}' on model '${config.modelName}' in strict mode`, {
+          model: config.modelName,
+          field: key,
+          meta: { operation, reason: "strict mode — unknown field" },
+        });
+      }
+    }
+  };
 
   /**
    * Projects a single record down to the fields listed in `select`.
@@ -307,11 +367,210 @@ export const createModelClient = (config: ModelClientConfig): ModelClientMethods
   };
 
   // ---------------------------------------------------------------------------
-  // Write method stubs — implemented in prompt 8.3
+  // Write methods
   // ---------------------------------------------------------------------------
 
-  const notImplemented = (): never => {
-    throw new Error("Write methods implemented in prompt 8.3");
+  /**
+   * Creates a single record. Validates fields, applies defaults, checks unique
+   * constraints, writes to disk, updates indexes, and returns the new record.
+   */
+  const create = (input: CreateInput): Promise<Record<string, unknown>> => {
+    assertConnected(isConnectedGetter, modelName, "create");
+    return operationTracker.track(
+      (async () => {
+        // Strict mode before strip — relation fields are valid in strict mode
+        assertStrictMode(input.data, "create");
+
+        // TODO: nested writes — wired in prompt 8.4
+        const cleanData = stripRelationFields(input.data);
+
+        const writerCtx = buildWriterCtx();
+        const record = await persistenceCreate(writerCtx, { data: cleanData });
+
+        // TODO: auto-compact trigger — wired in prompt 13.5
+        config.logger?.debug(`[${modelName}] create complete`);
+
+        // TODO: include — wired in prompt 8.4
+
+        return applySelect(record, input.select);
+      })(),
+    );
+  };
+
+  /**
+   * Creates multiple records. Validates all records before writing any
+   * (fail-fast, all-or-nothing validation). Returns `{ count: N }`.
+   *
+   * Note: `skipDuplicates` is a Phase 2 feature and is silently ignored
+   * in this implementation.
+   */
+  const createMany = (input: CreateManyInput): Promise<{ count: number }> => {
+    assertConnected(isConnectedGetter, modelName, "createMany");
+    return operationTracker.track(
+      (async () => {
+        const writerCtx = buildWriterCtx();
+
+        // Strict mode on all records first — validate before any writes
+        for (const record of input.data) {
+          assertStrictMode(record, "create");
+        }
+
+        // TODO: nested writes — wired in prompt 8.4
+        const cleanRecords = input.data.map(stripRelationFields);
+
+        const result = await persistenceCreateMany(writerCtx, { data: cleanRecords });
+
+        // TODO: auto-compact trigger — wired in prompt 13.5
+        config.logger?.debug(`[${modelName}] createMany complete`, { count: result.count });
+
+        return result;
+      })(),
+    );
+  };
+
+  /**
+   * Updates the single record identified by `where`. Throws `RecordNotFoundError`
+   * when no matching record exists. Returns the updated record.
+   */
+  const update = (input: UpdateInput): Promise<Record<string, unknown>> => {
+    assertConnected(isConnectedGetter, modelName, "update");
+    return operationTracker.track(
+      (async () => {
+        // Strict mode on raw data before strip
+        assertStrictMode(input.data, "update");
+
+        // TODO: nested writes — wired in prompt 8.4
+        const cleanData = stripRelationFields(input.data);
+
+        const writerCtx = buildWriterCtx();
+        // persistenceUpdate handles RecordNotFoundError internally with
+        // model + meta.where context already set correctly
+        const record = await persistenceUpdate(writerCtx, {
+          where: input.where,
+          data: cleanData,
+        });
+
+        // TODO: auto-compact trigger — wired in prompt 13.5
+        config.logger?.debug(`[${modelName}] update complete`);
+
+        // TODO: include — wired in prompt 8.4
+
+        return applySelect(record, input.select);
+      })(),
+    );
+  };
+
+  /**
+   * Updates all records matching `where`. When `where` is omitted, all records
+   * are updated. Returns `{ count: N }` where N is the number of records updated.
+   */
+  const updateMany = (input: UpdateManyInput): Promise<{ count: number }> => {
+    assertConnected(isConnectedGetter, modelName, "updateMany");
+    return operationTracker.track(
+      (async () => {
+        assertStrictMode(input.data, "update");
+
+        // TODO: nested writes — wired in prompt 8.4
+        const cleanData = stripRelationFields(input.data);
+
+        const writerCtx = buildWriterCtx();
+        const compiledFilter = input.where ? compileFilter(input.where) : undefined;
+
+        const result = await persistenceUpdateMany(writerCtx, { where: input.where, data: cleanData }, compiledFilter);
+
+        // TODO: auto-compact trigger — wired in prompt 13.5
+        config.logger?.debug(`[${modelName}] updateMany complete`, { count: result.count });
+
+        return result;
+      })(),
+    );
+  };
+
+  /**
+   * Deletes the single record identified by `where`.
+   * Throws `RecordNotFoundError` when `where` matches nothing.
+   * Returns the pre-deletion record state with system fields stripped.
+   */
+  const deleteRecord = (input: DeleteInput): Promise<Record<string, unknown>> => {
+    assertConnected(isConnectedGetter, modelName, "delete");
+    return operationTracker.track(
+      (async () => {
+        const writerCtx = buildWriterCtx();
+        const record = await persistenceDelete(writerCtx, { where: input.where });
+
+        // TODO: auto-compact trigger — wired in prompt 13.5
+        config.logger?.debug(`[${modelName}] delete complete`);
+
+        return record;
+      })(),
+    );
+  };
+
+  /**
+   * Deletes all records matching `where`.
+   * When `where` is omitted, all records are deleted.
+   * Returns `{ count: 0 }` when no records match — never throws for an empty match.
+   */
+  const deleteManyRecords = (input: DeleteManyInput): Promise<{ count: number }> => {
+    assertConnected(isConnectedGetter, modelName, "deleteMany");
+    return operationTracker.track(
+      (async () => {
+        const writerCtx = buildWriterCtx();
+        const compiledFilter = input.where ? compileFilter(input.where) : undefined;
+
+        const result = await persistenceDeleteMany(writerCtx, { where: input.where }, compiledFilter);
+
+        // TODO: auto-compact trigger — wired in prompt 13.5
+        config.logger?.debug(`[${modelName}] deleteMany complete`, { count: result.count });
+
+        return result;
+      })(),
+    );
+  };
+
+  /**
+   * Finds the record identified by `where`.
+   * - If it exists: updates it with `input.update` and returns the updated record.
+   * - If it does not exist: creates it with `input.create` and returns the new record.
+   *
+   * Note: upsert is a find-then-write operation, not atomic in Phase 1.
+   * Concurrent upserts on the same record may race.
+   */
+  const upsert = (input: UpsertInput): Promise<Record<string, unknown>> => {
+    assertConnected(isConnectedGetter, modelName, "upsert");
+    return operationTracker.track(
+      (async () => {
+        const readerCtx = buildReaderCtx();
+        const existing = await persistenceFindUnique(readerCtx, { where: input.where });
+
+        if (existing !== null) {
+          // Record exists — update path
+          assertStrictMode(input.update, "update");
+          const cleanUpdate = stripRelationFields(input.update);
+          const writerCtx = buildWriterCtx();
+          const updated = await persistenceUpdate(writerCtx, {
+            where: input.where,
+            data: cleanUpdate,
+          });
+
+          // TODO: auto-compact trigger — wired in prompt 13.5
+          // TODO: include — wired in prompt 8.4
+
+          return applySelect(updated, input.select);
+        }
+
+        // Record does not exist — create path
+        assertStrictMode(input.create, "create");
+        const cleanCreate = stripRelationFields(input.create);
+        const writerCtx = buildWriterCtx();
+        const created = await persistenceCreate(writerCtx, { data: cleanCreate });
+
+        // TODO: auto-compact trigger — wired in prompt 13.5
+        // TODO: include — wired in prompt 8.4
+
+        return applySelect(created, input.select);
+      })(),
+    );
   };
 
   return {
@@ -322,12 +581,12 @@ export const createModelClient = (config: ModelClientConfig): ModelClientMethods
     count,
     aggregate,
     groupBy,
-    create: notImplemented,
-    createMany: notImplemented,
-    update: notImplemented,
-    updateMany: notImplemented,
-    delete: notImplemented,
-    deleteMany: notImplemented,
-    upsert: notImplemented,
+    create,
+    createMany,
+    update,
+    updateMany,
+    delete: deleteRecord,
+    deleteMany: deleteManyRecords,
+    upsert,
   };
 };
