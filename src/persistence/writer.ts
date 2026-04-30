@@ -615,12 +615,6 @@ export async function update(ctx: ModelWriterContext, args: UpdateArgs): Promise
       tombstoneCount: existingMeta.tombstoneCount + 1,
     });
 
-    // Auto-compact threshold check (compaction triggered in prompt 5.8)
-    const updatedMeta = await readModelMeta(ctx.paths);
-    if (shouldAutoCompact(updatedMeta, ctx.autoCompactThreshold ?? 0.3)) {
-      // compaction will be triggered here in prompt 5.8
-    }
-
     // Step 13 — Return the updated record with system fields stripped
     return stripSystemFields(recordToWrite);
   } catch (err: unknown) {
@@ -783,12 +777,6 @@ export async function updateMany(
       tombstoneCount: existingMeta.tombstoneCount + toUpdate.length,
     });
 
-    // Auto-compact threshold check (compaction triggered in prompt 5.8)
-    const updatedMeta = await readModelMeta(ctx.paths);
-    if (shouldAutoCompact(updatedMeta, ctx.autoCompactThreshold ?? 0.3)) {
-      // compaction will be triggered here in prompt 5.8
-    }
-
     return { count: toUpdate.length };
   } catch (err: unknown) {
     if (err instanceof OrionDBError) throw err;
@@ -833,20 +821,6 @@ const buildTombstone = (rawRecord: Record<string, unknown>): Record<string, unkn
     _createdAt,
     _updatedAt: new Date().toISOString(),
   };
-};
-
-// ---------------------------------------------------------------------------
-// shouldAutoCompact (private)
-// ---------------------------------------------------------------------------
-
-/**
- * Returns `true` when the tombstone ratio meets or exceeds `threshold`.
- * Returns `false` when `totalLines` is 0 to avoid division by zero.
- * `threshold` is a fraction between 0 and 1 (e.g. 0.30 for 30%).
- */
-const shouldAutoCompact = (meta: ModelMeta, threshold: number): boolean => {
-  if (meta.totalLines === 0) return false;
-  return meta.tombstoneCount / meta.totalLines >= threshold;
 };
 
 // ---------------------------------------------------------------------------
@@ -922,12 +896,6 @@ export async function deleteRecord(ctx: ModelWriterContext, args: DeleteArgs): P
       recordCount: existingMeta.recordCount - 1,
       tombstoneCount: existingMeta.tombstoneCount + 1,
     });
-
-    // Auto-compact threshold check (compaction triggered in prompt 5.8)
-    const updatedMeta = await readModelMeta(ctx.paths);
-    if (shouldAutoCompact(updatedMeta, ctx.autoCompactThreshold ?? 0.3)) {
-      // compaction will be triggered here in prompt 5.8
-    }
 
     // Step 10 — Return pre-deletion record without system fields
     return stripSystemFields(rawRecord);
@@ -1027,12 +995,6 @@ export async function deleteMany(
       recordCount: existingMeta.recordCount - toDelete.length,
       tombstoneCount: existingMeta.tombstoneCount + toDelete.length,
     });
-
-    // Auto-compact threshold check (compaction triggered in prompt 5.8)
-    const updatedMeta = await readModelMeta(ctx.paths);
-    if (shouldAutoCompact(updatedMeta, ctx.autoCompactThreshold ?? 0.3)) {
-      // compaction will be triggered here in prompt 5.8
-    }
 
     // Step 5 — Return result
     return { count: toDelete.length };
